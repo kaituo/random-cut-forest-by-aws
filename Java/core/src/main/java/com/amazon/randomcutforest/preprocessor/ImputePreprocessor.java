@@ -56,7 +56,8 @@ public class ImputePreprocessor extends InitialSegmentPreprocessor {
         if (valuesSeen < startNormalization) {
             return null;
         }
-        checkArgument(timestamp > previousTimeStamps[shingleSize - 1], "incorrect ordering of time");
+        checkArgument(timestamp > previousTimeStamps[shingleSize - 1], "incorrect ordering of time, timestamp: "
+                + timestamp + " previousTimeStamps[shingleSize - 1]: " + previousTimeStamps[shingleSize - 1]);
 
         // generate next tuple without changing the forest, these get modified in the
         // transform
