@@ -1,0 +1,7 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+bgl,tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.500000,1086771,1.000000,119529,1922691,192,633807,0.058529,0.998396,0.110576
+bgl,conditional_tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.500000,1086771,1.000000,50069,1711830,69652,844668,0.028418,0.418214,0.053219
+bgl,tail_seed_expand_global_rarity_keyword_tiebreak_b144_e2,none,1.000000,1,0.500000,1086771,1.000000,119529,1922966,192,633532,0.058521,0.998396,0.110562
+bgl,tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.600000,1086771,1.000000,119529,1917872,192,638626,0.058667,0.998396,0.110823
+bgl,conditional_tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.600000,1086771,1.000000,46875,1703523,72846,852975,0.026780,0.391535,0.050130
+bgl,tail_seed_expand_global_rarity_keyword_tiebreak_b144_e2,none,1.000000,1,0.600000,1086771,1.000000,119529,1917872,192,638626,0.058667,0.998396,0.110823

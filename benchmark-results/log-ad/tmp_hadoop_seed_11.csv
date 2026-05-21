@@ -1,0 +1,7 @@
+dataset,model,rows,train_rows,test_rows,positives,negatives,features,auc,seconds
+Hadoop,Isolation Forest + parsed events,55,28,27,22,5,252,0.609091,0.111
+Hadoop,RCF offline + parsed events,55,28,27,22,5,252,0.627273,0.513
+
+model,average_auc
+Isolation Forest + parsed events,0.609091
+RCF offline + parsed events,0.627273

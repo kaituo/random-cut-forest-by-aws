@@ -72,4 +72,20 @@ public class BasicThresholderState implements Serializable {
 
     private DeviationState[] deviationStates;
 
+    private double targetAnomalyRate;
+
+    private double observedAnomalyRate;
+
+    private long rateControlCount;
+
+    private double logThresholdScale;
+
+    private int rateControlMinimumSamples;
+
+    private double rateControlLearningRate;
+
+    private double minThresholdScale;
+
+    private double maxThresholdScale;
+
 }

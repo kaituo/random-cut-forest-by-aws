@@ -52,6 +52,22 @@ public class BasicThresholderMapper implements IStateMapper<BasicThresholder, Ba
         thresholder.setAutoThreshold(state.isAutoThreshold());
         thresholder.setMinimumScores(state.getMinimumScores());
         thresholder.setZfactor(state.getZFactor());
+        thresholder.setTargetAnomalyRate(state.getTargetAnomalyRate());
+        thresholder.setObservedAnomalyRate(state.getObservedAnomalyRate());
+        thresholder.setRateControlCount(state.getRateControlCount());
+        if (state.getRateControlMinimumSamples() > 0) {
+            thresholder.setRateControlMinimumSamples(state.getRateControlMinimumSamples());
+        }
+        if (state.getRateControlLearningRate() > 0) {
+            thresholder.setRateControlLearningRate(state.getRateControlLearningRate());
+        }
+        if (state.getMinThresholdScale() > 0) {
+            thresholder.setMinThresholdScale(state.getMinThresholdScale());
+        }
+        if (state.getMaxThresholdScale() > 0) {
+            thresholder.setMaxThresholdScale(state.getMaxThresholdScale());
+        }
+        thresholder.setLogThresholdScale(state.getLogThresholdScale());
         return thresholder;
     }
 
@@ -69,6 +85,14 @@ public class BasicThresholderMapper implements IStateMapper<BasicThresholder, Ba
         state.setMinimumScores(model.getMinimumScores());
         state.setDeviationStates(getStates(model.getDeviations(), deviationMapper));
         state.setHorizon(model.getScoreDifferencing());
+        state.setTargetAnomalyRate(model.getTargetAnomalyRate());
+        state.setObservedAnomalyRate(model.getObservedAnomalyRate());
+        state.setRateControlCount(model.getRateControlCount());
+        state.setLogThresholdScale(model.getLogThresholdScale());
+        state.setRateControlMinimumSamples(model.getRateControlMinimumSamples());
+        state.setRateControlLearningRate(model.getRateControlLearningRate());
+        state.setMinThresholdScale(model.getMinThresholdScale());
+        state.setMaxThresholdScale(model.getMaxThresholdScale());
         return state;
     }
 

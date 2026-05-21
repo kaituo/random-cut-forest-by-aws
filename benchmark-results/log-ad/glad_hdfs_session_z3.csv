@@ -1,0 +1,2 @@
+name,evaluated,positive,predicted,tp,fp,fn,tn,precision,recall,f1,max_score,max_threshold,elapsed_s,state
+HDFS_session_GLAD,573061,16791,13423,7636,5787,9155,550483,0.568874,0.454767,0.505461,10.000000,19.743348,3.239,capacity=2000,z=3.00,clusters=4

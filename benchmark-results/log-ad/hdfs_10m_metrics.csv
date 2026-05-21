@@ -1,0 +1,8 @@
+dataset,input,bucket_seconds,buckets,positive_buckets,logs,anomalous_logs
+hdfs,/tmp/loghub_data/HDFS/HDFS.log,600,233,232,11175629,288250
+
+detector,evaluated_buckets,positive_buckets,predicted_buckets,tp,fp,fn,tn,precision,recall,f1,avg_ms_per_bucket,avg_us_per_log,state
+current_LogAnomalyDetector,213,212,162,162,0,50,1,1.000000,0.764151,0.866310,518.644506,11.650152,rcf=50x128,shingle=4
+current_LogAnomalyDetector_updateBaseline,213,212,117,117,0,95,1,1.000000,0.551887,0.711246,516.877792,11.610467,rcf=50x128,shingle=4
+Drain_signal_EWMA_no_RCF,213,212,16,16,0,196,1,1.000000,0.075472,0.140351,152.819702,3.432742,templates=43,rcf=none
+Drain_template_EWMA_no_RCF,213,212,8,8,0,204,1,1.000000,0.037736,0.072727,152.157094,3.417858,templates=43,per_template_ewma,rcf=none

@@ -1,0 +1,13 @@
+dataset,model,rows,train_rows,test_rows,positives,negatives,features,auc,seconds
+BGL,Isolation Forest + parsed events,474167,23709,450458,33302,417156,217,0.722898,1.086
+BGL,RCF offline + parsed events,474167,23709,450458,33302,417156,217,0.725579,81.391
+Hadoop,Isolation Forest + parsed events,55,28,27,22,5,253,0.363636,0.111
+Hadoop,RCF offline + parsed events,55,28,27,22,5,253,0.354545,0.556
+HDFS,Isolation Forest + parsed events,57564,2879,54685,1562,53123,19,0.985350,0.312
+HDFS,RCF offline + parsed events,57564,2879,54685,1562,53123,19,0.996038,1.882
+Thunderbird,Isolation Forest + parsed events,633729,31687,602042,9344,592698,772,0.929831,1.447
+Thunderbird,RCF offline + parsed events,633729,31687,602042,9344,592698,772,0.529614,517.586
+
+model,average_auc
+Isolation Forest + parsed events,0.750429
+RCF offline + parsed events,0.651444

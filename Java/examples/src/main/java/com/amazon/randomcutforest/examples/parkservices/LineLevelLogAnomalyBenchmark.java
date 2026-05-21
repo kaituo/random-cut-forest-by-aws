@@ -1,0 +1,3807 @@
+/*
+ * Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License").
+ */
+
+package com.amazon.randomcutforest.examples.parkservices;
+
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+import com.amazon.randomcutforest.config.TransformMethod;
+import com.amazon.randomcutforest.parkservices.AnomalyDescriptor;
+import com.amazon.randomcutforest.parkservices.ThresholdedRandomCutForest;
+import com.amazon.randomcutforest.parkservices.config.ScoringStrategy;
+
+/**
+ * Line-level log anomaly benchmark:
+ *
+ * 1. Parse raw BGL/Thunderbird-style logs into Drain-like template ids.
+ * 2. Build template rarity, OOV, transition surprise, and bucket spike scores.
+ * 3. Optionally use TRCF as a high-recall bucket context detector.
+ * 4. Tune the final line-score threshold on validation buckets and report held-out
+ * line precision/recall/F1.
+ */
+public final class LineLevelLogAnomalyBenchmark {
+
+    private static final Charset RAW_LOG_CHARSET = StandardCharsets.ISO_8859_1;
+
+    private LineLevelLogAnomalyBenchmark() {
+    }
+
+    public static void main(String[] args) throws Exception {
+        Config config = Config.parse(args);
+        if ("diagnostic".equals(config.thresholdMode)) {
+            List<TemplateDiagnostic> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetTemplateDiagnostic(datasetName, config));
+            }
+            writeTemplateDiagnostics(config.output, results);
+            printTemplateDiagnostics(results, config.top);
+        } else if ("oracle".equals(config.thresholdMode)) {
+            List<OracleResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetOracle(datasetName, config));
+            }
+            writeOracleResults(config.output, results);
+            printOracleSummary(results, config.top);
+        } else if ("adaptive".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetAdaptive(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("tail".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetTailExcess(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("quantile".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetQuantile(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("topk".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetTopKPolicy(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("fdr".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetFdr(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else {
+            List<Result> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetSupervised(datasetName, config));
+            }
+            writeResults(config.output, results);
+            printSummary(results, config.top);
+        }
+    }
+
+    private static List<Result> evaluateDatasetSupervised(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = TrainStats.from(dataset, split.trainEnd, config);
+            List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+            List<Result> results = new ArrayList<>();
+            for (LineScorer scorer : LineScorer.suite()) {
+                for (ContextSet context : contexts) {
+                    if (!config.includeUngated && context.isUngated()) {
+                        continue;
+                    }
+                Result result = evaluate(datasetName, dataset, stats, scorer, context, split.trainEnd,
+                        split.calibrationEnd, config);
+                results.add(result);
+                System.out.println(result.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetAdaptive(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            double contextRecall = contextLineRecall(dataset, context, split.calibrationEnd, dataset.buckets.size());
+            for (double q : config.fdrQValues) {
+                FdrResult rolling = evaluateRollingLineBh(datasetName, dataset, stats, context, q, split.calibrationEnd,
+                        dataset.buckets.size(), contextRecall, config, false);
+                results.add(rolling);
+                System.out.println(rolling.toCsv());
+                FdrResult conditional = evaluateRollingLineBh(datasetName, dataset, stats, context, q,
+                        split.calibrationEnd, dataset.buckets.size(), contextRecall, config, true);
+                results.add(conditional);
+                System.out.println(conditional.toCsv());
+                FdrResult spike = evaluateRollingTemplateSpikeBh(datasetName, dataset, context, q, split.calibrationEnd,
+                        dataset.buckets.size(), contextRecall, config);
+                results.add(spike);
+                System.out.println(spike.toCsv());
+                FdrResult seedExpand = evaluateSeedExpand(datasetName, dataset, stats, context, q, split.calibrationEnd,
+                        dataset.buckets.size(), contextRecall, config);
+                results.add(seedExpand);
+                System.out.println(seedExpand.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetFdr(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            int calibrationStart = calibrationStartBucket(split, config);
+            double[] lineCalibrationScores = calibrationLineScores(dataset, stats, context, calibrationStart,
+                    split.calibrationEnd, config);
+            double[] cellCalibrationScores = calibrationCellScores(dataset, stats, context, calibrationStart,
+                    split.calibrationEnd);
+            java.util.Arrays.sort(lineCalibrationScores);
+            java.util.Arrays.sort(cellCalibrationScores);
+            double contextRecall = contextLineRecall(dataset, context, split.calibrationEnd, dataset.buckets.size());
+            for (double q : config.fdrQValues) {
+                FdrResult line = evaluateLineBh(datasetName, dataset, stats, context, lineCalibrationScores, q,
+                        split.calibrationEnd, dataset.buckets.size(), contextRecall, config);
+                results.add(line);
+                System.out.println(line.toCsv());
+                FdrResult cell = evaluateCellBh(datasetName, dataset, stats, context, cellCalibrationScores, q,
+                        split.calibrationEnd, dataset.buckets.size(), contextRecall);
+                results.add(cell);
+                System.out.println(cell.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetTailExcess(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            double contextRecall = contextLineRecall(dataset, context, split.calibrationEnd, dataset.buckets.size());
+            int calibrationStart = calibrationStartBucket(split, config);
+            TailCalibration lineCalibration = tailCalibration(dataset, stats, context, calibrationStart,
+                    split.calibrationEnd, config, false);
+            TailCalibration conditionalCalibration = tailCalibration(dataset, stats, context, calibrationStart,
+                    split.calibrationEnd, config, true);
+            for (double targetPrecision : config.fdrQValues) {
+                FdrResult line = evaluateTailExcess(datasetName, dataset, stats, context, lineCalibration,
+                        targetPrecision, split.calibrationEnd, dataset.buckets.size(), contextRecall, config, false);
+                results.add(line);
+                System.out.println(line.toCsv());
+                FdrResult conditional = evaluateTailExcess(datasetName, dataset, stats, context, conditionalCalibration,
+                        targetPrecision, split.calibrationEnd, dataset.buckets.size(), contextRecall, config, true);
+                results.add(conditional);
+                System.out.println(conditional.toCsv());
+                FdrResult seedExpand = evaluateTailSeedExpand(datasetName, dataset, stats, context, lineCalibration,
+                        targetPrecision, split.calibrationEnd, dataset.buckets.size(), contextRecall, config);
+                results.add(seedExpand);
+                System.out.println(seedExpand.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetQuantile(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            int calibrationStart = calibrationStartBucket(split, config);
+            double[] calibrationScores = calibrationLineScores(dataset, stats, context, calibrationStart,
+                    split.calibrationEnd, config);
+            java.util.Arrays.sort(calibrationScores);
+            double contextRecall = contextLineRecall(dataset, context, split.calibrationEnd, dataset.buckets.size());
+            for (double quantile : config.fdrQValues) {
+                FdrResult fixed = evaluateFixedQuantile(datasetName, dataset, stats, context, calibrationScores,
+                        quantile, split.calibrationEnd, dataset.buckets.size(), contextRecall, config);
+                results.add(fixed);
+                System.out.println(fixed.toCsv());
+            }
+            for (QuantilePair pair : config.seedExpandPairs) {
+                FdrResult seedExpand = evaluateQuantileSeedExpand(datasetName, dataset, stats, context,
+                        calibrationScores, pair.seedQuantile, pair.expandQuantile, split.calibrationEnd,
+                        dataset.buckets.size(), contextRecall, config);
+                results.add(seedExpand);
+                System.out.println(seedExpand.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetTopKPolicy(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            double contextRecall = contextLineRecall(dataset, context, split.calibrationEnd, dataset.buckets.size());
+            for (double value : config.fdrQValues) {
+                int k = max(1, (int) Math.round(value));
+                FdrResult topK = evaluateTopKPerBucket(datasetName, dataset, stats, context, k, split.calibrationEnd,
+                        dataset.buckets.size(), contextRecall, config);
+                results.add(topK);
+                System.out.println(topK.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<OracleResult> evaluateDatasetOracle(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        List<ContextSet> contexts = contexts(dataset, stats, split.trainEnd, config);
+        List<OracleResult> results = new ArrayList<>();
+        for (ContextSet context : contexts) {
+            OracleResult configured = oracleDiagnosticScoreMode(datasetName, config.scoreMode, dataset, stats, context,
+                    split.calibrationEnd, dataset.buckets.size());
+            results.add(configured);
+            System.out.println(configured.toCsv());
+            OracleResult combined = oracleDiagnostic(datasetName, "combined_line_score", dataset, stats, context,
+                    split.calibrationEnd, dataset.buckets.size(), true);
+            results.add(combined);
+            System.out.println(combined.toCsv());
+            for (LineScorer scorer : LineScorer.suite()) {
+                OracleResult result = oracleDiagnostic(datasetName, scorer.name(), dataset, stats, context,
+                        split.calibrationEnd, dataset.buckets.size(), false);
+                results.add(result);
+                System.out.println(result.toCsv());
+            }
+        }
+        return results;
+    }
+
+    private static List<TemplateDiagnostic> evaluateDatasetTemplateDiagnostic(String datasetName, Config config)
+            throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        TrainStats stats = statsForSplit(dataset, split, config);
+        ContextSet context = ContextSet.all("none", dataset.buckets.size());
+        DiagnosticThreshold threshold;
+        if (Double.isFinite(config.diagnosticQuantile)) {
+            double[] calibrationScores = calibrationLineScores(dataset, stats, context, calibrationStartBucket(split, config),
+                    split.calibrationEnd, config);
+            java.util.Arrays.sort(calibrationScores);
+            double value = quantile(calibrationScores, config.diagnosticQuantile);
+            threshold = evaluateFixedThreshold(dataset, stats, context, split.calibrationEnd, dataset.buckets.size(),
+                    config.scoreMode, value);
+        } else {
+            threshold = chooseScoreModeThreshold(dataset, stats, context, split.calibrationEnd,
+                    dataset.buckets.size(), config.scoreMode, config.diagnosticRecallTarget);
+        }
+        System.out.printf(Locale.ROOT,
+                "diagnostic dataset=%s score_mode=%s threshold=%.8f precision=%.6f recall=%.6f f1=%.6f%n",
+                datasetName, config.scoreMode, threshold.threshold, threshold.precision, threshold.recall, threshold.f1);
+        TemplateAggregate[] aggregates = new TemplateAggregate[max(1, dataset.templateCount)];
+        for (int eventId = 0; eventId < aggregates.length; eventId++) {
+            aggregates[eventId] = new TemplateAggregate(eventId);
+        }
+        for (int bucketIndex = split.calibrationEnd; bucketIndex < dataset.buckets.size(); bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                int eventId = dataset.eventIds.values[i];
+                double score = lineScore(dataset, stats, context, i, config.scoreMode);
+                boolean label = dataset.labels.values[i] != 0;
+                boolean prediction = score >= threshold.threshold;
+                aggregates[eventId].add(dataset, i, score, label, prediction, config.diagnosticSamples);
+            }
+        }
+        List<TemplateDiagnostic> results = new ArrayList<>();
+        collectTemplateDiagnostics(datasetName, dataset, stats, config, threshold, aggregates, "fp", results);
+        collectTemplateDiagnostics(datasetName, dataset, stats, config, threshold, aggregates, "fn", results);
+        collectTemplateDiagnostics(datasetName, dataset, stats, config, threshold, aggregates, "tp", results);
+        return results;
+    }
+
+    private static DiagnosticThreshold evaluateFixedThreshold(Dataset dataset, TrainStats stats, ContextSet context,
+            int startBucket, int endBucket, String scoreMode, double threshold) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean prediction = context.candidates[bucketIndex]
+                        && lineScore(dataset, stats, context, i, scoreMode) >= threshold;
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+            }
+        }
+        return new DiagnosticThreshold(threshold, metrics.precision(), metrics.recall(), metrics.f1());
+    }
+
+    private static DiagnosticThreshold chooseScoreModeThreshold(Dataset dataset, TrainStats stats, ContextSet context,
+            int startBucket, int endBucket, String scoreMode, double targetRecall) {
+        int count = dataset.countLines(startBucket, endBucket, context);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            if (!context.candidates[bucketIndex]) {
+                continue;
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean label = dataset.labels.values[i] != 0;
+                packed[index++] = pack(lineScore(dataset, stats, context, i, scoreMode), label);
+                if (label) {
+                    ++positives;
+                }
+            }
+        }
+        if (index == 0 || positives == 0) {
+            return new DiagnosticThreshold(Double.POSITIVE_INFINITY, 0, 0, 0);
+        }
+        java.util.Arrays.sort(packed, 0, index);
+        long tp = 0;
+        double bestPrecision = -1.0;
+        double bestRecall = 0.0;
+        double bestF1 = 0.0;
+        double bestThreshold = Double.POSITIVE_INFINITY;
+        for (int i = 0; i < index; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+            }
+            double precision = tp / (double) (i + 1L);
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0.0 : 2.0 * precision * recall / (precision + recall);
+            if (recall >= targetRecall && precision > bestPrecision) {
+                bestPrecision = precision;
+                bestRecall = recall;
+                bestF1 = f1;
+                bestThreshold = unpackScore(packed[i]);
+            }
+        }
+        if (bestPrecision < 0.0) {
+            return new DiagnosticThreshold(Double.POSITIVE_INFINITY, 0, 0, 0);
+        }
+        return new DiagnosticThreshold(bestThreshold, bestPrecision, bestRecall, bestF1);
+    }
+
+    private static void collectTemplateDiagnostics(String datasetName, Dataset dataset, TrainStats stats, Config config,
+            DiagnosticThreshold threshold, TemplateAggregate[] aggregates, String group,
+            List<TemplateDiagnostic> results) {
+        List<TemplateAggregate> sorted = new ArrayList<>();
+        for (TemplateAggregate aggregate : aggregates) {
+            if ("fp".equals(group) && aggregate.fp > 0 || "fn".equals(group) && aggregate.fn > 0
+                    || "tp".equals(group) && aggregate.tp > 0) {
+                sorted.add(aggregate);
+            }
+        }
+        sorted.sort((a, b) -> Long.compare(b.countFor(group), a.countFor(group)));
+        for (int i = 0; i < min(config.diagnosticTopTemplates, sorted.size()); i++) {
+            TemplateAggregate aggregate = sorted.get(i);
+            results.add(aggregate.toDiagnostic(datasetName, dataset, stats, config.scoreMode, group, threshold));
+        }
+    }
+
+    private static Dataset loadDataset(String datasetName, Config config) throws IOException {
+        int sampleModulo = "thunderbird".equals(datasetName) ? config.thunderbirdSampleModulo : config.bglSampleModulo;
+        String input = "thunderbird".equals(datasetName) ? config.thunderbirdPath : config.bglPath;
+        return Dataset.load(datasetName, input, sampleModulo, config);
+    }
+
+    private static TrainStats statsForSplit(Dataset dataset, Split split, Config config) {
+        switch (config.statsPeriod) {
+        case "calibration":
+            return TrainStats.fromRange(dataset, split.trainEnd, split.calibrationEnd, config);
+        case "warmup":
+            return TrainStats.fromRange(dataset, 0, split.calibrationEnd, config);
+        case "train":
+        default:
+            return TrainStats.from(dataset, split.trainEnd, config);
+        }
+    }
+
+    private static int calibrationStartBucket(Split split, Config config) {
+        return "warmup".equals(config.statsPeriod) ? 0 : split.trainEnd;
+    }
+
+    private static List<ContextSet> contexts(Dataset dataset, TrainStats stats, int trainEnd, Config config) {
+        List<ContextSet> contexts = new ArrayList<>();
+        contexts.add(ContextSet.all("none", dataset.buckets.size()));
+        for (double anomalyRate : config.contextAnomalyRates) {
+            contexts.add(ContextSet.trcf(dataset, stats, trainEnd, anomalyRate, 1, config));
+            contexts.add(ContextSet.trcf(dataset, stats, trainEnd, anomalyRate, 4, config));
+        }
+        return contexts;
+    }
+
+    private static Result evaluate(String datasetName, Dataset dataset, TrainStats stats, LineScorer scorer,
+            ContextSet context, int trainEnd, int validationEnd, Config config) {
+        ThresholdChoice threshold = chooseThreshold(dataset, stats, scorer, context, trainEnd, validationEnd);
+        Metrics testMetrics = lineMetrics(dataset, stats, scorer, context, threshold.threshold, validationEnd,
+                dataset.buckets.size());
+        TopKMetrics topK = topKMetrics(dataset, stats, scorer, context, validationEnd, dataset.buckets.size(), 5);
+        long testAnomalies = anomalousLines(dataset, validationEnd, dataset.buckets.size());
+        long coveredAnomalies = coveredAnomalousLines(dataset, context, validationEnd, dataset.buckets.size());
+        double candidateRecall = testAnomalies == 0 ? 0.0 : coveredAnomalies / (double) testAnomalies;
+        return new Result(datasetName, scorer.name(), context.name, context.anomalyRate, context.shingleSize,
+                threshold.threshold, threshold.validationPrecision, threshold.validationRecall, threshold.validationF1,
+                candidateRecall, testMetrics, topK);
+    }
+
+    private static ThresholdChoice chooseThreshold(Dataset dataset, TrainStats stats, LineScorer scorer,
+            ContextSet context, int startBucket, int endBucket) {
+        int count = dataset.countLines(startBucket, endBucket, context);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        for (int i = 0; i < dataset.labels.size; i++) {
+            int bucketIndex = dataset.bucketIndexes.values[i];
+            if (bucketIndex < startBucket || bucketIndex >= endBucket || !context.candidates[bucketIndex]) {
+                continue;
+            }
+            double score = scorer.score(dataset, stats, i);
+            packed[index++] = pack(score, dataset.labels.values[i] != 0);
+            if (dataset.labels.values[i] != 0) {
+                ++positives;
+            }
+        }
+        if (index == 0 || positives == 0) {
+            return new ThresholdChoice(Double.POSITIVE_INFINITY, 0, 0, 0);
+        }
+        java.util.Arrays.sort(packed, 0, index);
+        long tp = 0;
+        double bestF1 = 0;
+        double bestPrecision = 0;
+        double bestRecall = 0;
+        double bestThreshold = Double.POSITIVE_INFINITY;
+        for (int i = 0; i < index; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+            }
+            long predicted = i + 1L;
+            double precision = tp / (double) predicted;
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+            if (f1 > bestF1) {
+                bestF1 = f1;
+                bestPrecision = precision;
+                bestRecall = recall;
+                bestThreshold = unpackScore(packed[i]);
+            }
+        }
+        return new ThresholdChoice(bestThreshold, bestPrecision, bestRecall, bestF1);
+    }
+
+    private static Metrics lineMetrics(Dataset dataset, TrainStats stats, LineScorer scorer, ContextSet context,
+            double threshold, int startBucket, int endBucket) {
+        long tp = 0;
+        long fp = 0;
+        long fn = 0;
+        long tn = 0;
+        for (int i = 0; i < dataset.labels.size; i++) {
+            int bucketIndex = dataset.bucketIndexes.values[i];
+            if (bucketIndex < startBucket || bucketIndex >= endBucket) {
+                continue;
+            }
+            boolean label = dataset.labels.values[i] != 0;
+            boolean prediction = context.candidates[bucketIndex] && scorer.score(dataset, stats, i) >= threshold;
+            if (label && prediction) {
+                ++tp;
+            } else if (prediction) {
+                ++fp;
+            } else if (label) {
+                ++fn;
+            } else {
+                ++tn;
+            }
+        }
+        return new Metrics(tp, fp, fn, tn);
+    }
+
+    private static TopKMetrics topKMetrics(Dataset dataset, TrainStats stats, LineScorer scorer, ContextSet context,
+            int startBucket, int endBucket, int maxK) {
+        TopK[] topByBucket = new TopK[dataset.buckets.size()];
+        long totalAnomalies = 0;
+        for (int i = 0; i < dataset.labels.size; i++) {
+            int bucketIndex = dataset.bucketIndexes.values[i];
+            if (bucketIndex < startBucket || bucketIndex >= endBucket) {
+                continue;
+            }
+            if (dataset.labels.values[i] != 0) {
+                ++totalAnomalies;
+            }
+            if (!context.candidates[bucketIndex]) {
+                continue;
+            }
+            TopK top = topByBucket[bucketIndex];
+            if (top == null) {
+                top = new TopK(maxK);
+                topByBucket[bucketIndex] = top;
+            }
+            top.add(scorer.score(dataset, stats, i), dataset.labels.values[i] != 0);
+        }
+        int[] predicted = new int[maxK];
+        int[] truePositive = new int[maxK];
+        for (TopK top : topByBucket) {
+            if (top == null) {
+                continue;
+            }
+            top.sortDescending();
+            for (int k = 1; k <= maxK; k++) {
+                int selected = min(k, top.size);
+                predicted[k - 1] += selected;
+                for (int i = 0; i < selected; i++) {
+                    if (top.labels[i]) {
+                        ++truePositive[k - 1];
+                    }
+                }
+            }
+        }
+        return new TopKMetrics(predicted, truePositive, totalAnomalies);
+    }
+
+    private static double[] calibrationLineScores(Dataset dataset, TrainStats stats, ContextSet context, int startBucket,
+            int endBucket, Config config) {
+        double[] scores = new double[dataset.countLines(startBucket, endBucket)];
+        int index = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                scores[index++] = lineScore(dataset, stats, context, i, config.scoreMode);
+            }
+        }
+        return scores;
+    }
+
+    private static double[] calibrationCellScores(Dataset dataset, TrainStats stats, ContextSet context, int startBucket,
+            int endBucket) {
+        int count = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            count += dataset.buckets.get(bucketIndex).eventCounts.size();
+        }
+        double[] scores = new double[count];
+        int index = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            Bucket bucket = dataset.buckets.get(bucketIndex);
+            for (int eventId : bucket.eventCounts.keySet()) {
+                scores[index++] = fdrCellScore(bucket, stats, context, bucketIndex, eventId);
+            }
+        }
+        return scores;
+    }
+
+    private static FdrResult evaluateLineBh(String datasetName, Dataset dataset, TrainStats stats, ContextSet context,
+            double[] calibrationScores, double q, int startBucket, int endBucket, double contextLineRecall) {
+        throw new UnsupportedOperationException("use overload with config");
+    }
+
+    private static FdrResult evaluateLineBh(String datasetName, Dataset dataset, TrainStats stats, ContextSet context,
+            double[] calibrationScores, double q, int startBucket, int endBucket, double contextLineRecall,
+            Config config) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            int start = dataset.lineStarts[bucketIndex];
+            int end = dataset.lineStarts[bucketIndex + 1];
+            int size = end - start;
+            if (size <= 0) {
+                continue;
+            }
+            double[] pValues = new double[size];
+            for (int offset = 0; offset < size; offset++) {
+                pValues[offset] = empiricalUpperTailPValue(calibrationScores,
+                        lineScore(dataset, stats, context, start + offset, config.scoreMode));
+            }
+            double cutoff = bhCutoff(pValues, q);
+            for (int offset = 0; offset < size; offset++) {
+                metrics = metrics.add(dataset.labels.values[start + offset] != 0, cutoff >= 0.0 && pValues[offset] <= cutoff);
+            }
+        }
+        return new FdrResult(datasetName, "line_bh_" + config.scoreMode, context.name, context.anomalyRate,
+                context.shingleSize, q, calibrationScores.length, contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateCellBh(String datasetName, Dataset dataset, TrainStats stats, ContextSet context,
+            double[] calibrationScores, double q, int startBucket, int endBucket, double contextLineRecall) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        boolean[] selectedEvents = new boolean[max(1, dataset.templateCount)];
+        List<Integer> selected = new ArrayList<>();
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            Bucket bucket = dataset.buckets.get(bucketIndex);
+            int size = bucket.eventCounts.size();
+            if (size <= 0) {
+                continue;
+            }
+            int[] eventIds = new int[size];
+            double[] pValues = new double[size];
+            int index = 0;
+            for (int eventId : bucket.eventCounts.keySet()) {
+                eventIds[index] = eventId;
+                pValues[index] = empiricalUpperTailPValue(calibrationScores,
+                        fdrCellScore(bucket, stats, context, bucketIndex, eventId));
+                ++index;
+            }
+            double cutoff = bhCutoff(pValues, q);
+            if (cutoff >= 0.0) {
+                for (int i = 0; i < size; i++) {
+                    if (pValues[i] <= cutoff) {
+                        selectedEvents[eventIds[i]] = true;
+                        selected.add(eventIds[i]);
+                    }
+                }
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                metrics = metrics.add(dataset.labels.values[i] != 0, selectedEvents[dataset.eventIds.values[i]]);
+            }
+            for (int eventId : selected) {
+                selectedEvents[eventId] = false;
+            }
+            selected.clear();
+        }
+        return new FdrResult(datasetName, "cell_bh", context.name, context.anomalyRate, context.shingleSize, q,
+                calibrationScores.length, contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateFixedQuantile(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, double[] calibrationScores, double quantile, int startBucket, int endBucket,
+            double contextLineRecall, Config config) {
+        double threshold = quantile(calibrationScores, quantile);
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean prediction = context.candidates[bucketIndex]
+                        && lineScore(dataset, stats, context, i, config.scoreMode) >= threshold;
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+            }
+        }
+        return new FdrResult(datasetName,
+                String.format(Locale.ROOT, "fixed_quantile_%s_p%.5f", config.scoreMode, quantile), context.name,
+                context.anomalyRate, context.shingleSize, quantile, calibrationScores.length, contextLineRecall,
+                metrics);
+    }
+
+    private static FdrResult evaluateQuantileSeedExpand(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, double[] calibrationScores, double seedQuantile, double expandQuantile, int startBucket,
+            int endBucket, double contextLineRecall, Config config) {
+        double seedThreshold = quantile(calibrationScores, seedQuantile);
+        double expandThreshold = quantile(calibrationScores, expandQuantile);
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            Map<Long, Boolean> seedKeys = new HashMap<>();
+            for (int seedBucket = max(startBucket, bucketIndex - config.expandBuckets);
+                    seedBucket <= min(endBucket - 1, bucketIndex + config.expandBuckets); seedBucket++) {
+                for (int i = dataset.lineStarts[seedBucket]; i < dataset.lineStarts[seedBucket + 1]; i++) {
+                    if (context.candidates[seedBucket]
+                            && lineScore(dataset, stats, context, i, config.scoreMode) >= seedThreshold) {
+                        seedKeys.put(entityEventKey(dataset.entityIds.values[i], dataset.eventIds.values[i]), Boolean.TRUE);
+                    }
+                }
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                long key = entityEventKey(dataset.entityIds.values[i], dataset.eventIds.values[i]);
+                boolean prediction = context.candidates[bucketIndex] && seedKeys.containsKey(key)
+                        && lineScore(dataset, stats, context, i, config.scoreMode) >= expandThreshold;
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+            }
+        }
+        double q = seedQuantile + expandQuantile / 100.0;
+        return new FdrResult(datasetName,
+                String.format(Locale.ROOT, "quantile_seed_expand_%s_s%.5f_x%.5f_e%d", config.scoreMode,
+                        seedQuantile, expandQuantile, config.expandBuckets),
+                context.name, context.anomalyRate, context.shingleSize, q, calibrationScores.length,
+                contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateTopKPerBucket(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, int k, int startBucket, int endBucket, double contextLineRecall, Config config) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            int start = dataset.lineStarts[bucketIndex];
+            int end = dataset.lineStarts[bucketIndex + 1];
+            int size = end - start;
+            if (size <= 0) {
+                continue;
+            }
+            long[] packed = new long[size];
+            for (int offset = 0; offset < size; offset++) {
+                int lineIndex = start + offset;
+                double score = context.candidates[bucketIndex] ? lineScore(dataset, stats, context, lineIndex,
+                        config.scoreMode) : Double.NEGATIVE_INFINITY;
+                packed[offset] = pack(score, dataset.labels.values[lineIndex] != 0);
+            }
+            java.util.Arrays.sort(packed);
+            int selected = min(k, size);
+            for (int offset = 0; offset < size; offset++) {
+                boolean prediction = offset < selected && context.candidates[bucketIndex];
+                boolean label = (packed[offset] & 1L) != 0;
+                metrics.add(label, prediction);
+            }
+        }
+        return new FdrResult(datasetName, "topk_per_bucket_" + config.scoreMode + "_k" + k, context.name,
+                context.anomalyRate, context.shingleSize, k, 0, contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateRollingLineBh(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, double q, int startBucket, int endBucket, double contextLineRecall, Config config,
+            boolean conditional) {
+        RollingLineCalibrator calibrator = new RollingLineCalibrator(config.rollingScoreMax, config.rollingBins,
+                conditional);
+        int initStart = max(0, startBucket - config.rollingHorizonBuckets);
+        for (int bucketIndex = initStart; bucketIndex < startBucket; bucketIndex++) {
+            calibrator.add(bucketScores(dataset, stats, context, bucketIndex, config, conditional));
+        }
+        while (calibrator.size() > config.rollingHorizonBuckets) {
+            calibrator.removeOldest();
+        }
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            ScoreBucket current = bucketScores(dataset, stats, context, bucketIndex, config, conditional);
+            double[] pValues = new double[current.scores.length];
+            for (int i = 0; i < current.scores.length; i++) {
+                pValues[i] = calibrator.pValue(current.scores[i], current.classes[i]);
+            }
+            double cutoff = bhCutoff(pValues, q);
+            boolean[] predictions = new boolean[current.scores.length];
+            int kept = 0;
+            for (int offset = 0; offset < current.scores.length; offset++) {
+                boolean prediction = cutoff >= 0.0 && pValues[offset] <= cutoff;
+                predictions[offset] = prediction;
+                metrics.add(dataset.labels.values[current.startLine + offset] != 0, prediction);
+                if (!prediction || !config.excludeAlertUpdates) {
+                    current.scores[kept] = current.scores[offset];
+                    current.classes[kept] = current.classes[offset];
+                    ++kept;
+                }
+            }
+            calibrator.add(current.truncate(kept));
+            while (calibrator.size() > config.rollingHorizonBuckets) {
+                calibrator.removeOldest();
+            }
+        }
+        String method = (conditional ? "rolling_conditional_bh_" : "rolling_line_bh_") + config.scoreMode
+                + "_h" + config.rollingHorizonBuckets;
+        return new FdrResult(datasetName, method, context.name, context.anomalyRate, context.shingleSize, q,
+                calibrator.totalCount(), contextLineRecall, metrics);
+    }
+
+    private static ScoreBucket bucketScores(Dataset dataset, TrainStats stats, ContextSet context, int bucketIndex,
+            Config config, boolean conditional) {
+        int start = dataset.lineStarts[bucketIndex];
+        int end = dataset.lineStarts[bucketIndex + 1];
+        double[] scores = new double[end - start];
+        int[] classes = new int[end - start];
+        for (int i = start; i < end; i++) {
+            int offset = i - start;
+            scores[offset] = lineScore(dataset, stats, context, i, config.scoreMode);
+            classes[offset] = conditional ? keywordClass(dataset.keywordScores.values[i]) : 0;
+        }
+        return new ScoreBucket(start, scores, classes);
+    }
+
+    private static int keywordClass(int keyword) {
+        if (keyword >= 8) {
+            return 3;
+        }
+        if (keyword >= 4) {
+            return 2;
+        }
+        if (keyword >= 1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    private static FdrResult evaluateRollingTemplateSpikeBh(String datasetName, Dataset dataset, ContextSet context,
+            double q, int startBucket, int endBucket, double contextLineRecall, Config config) {
+        RollingTemplateBaseline baseline = new RollingTemplateBaseline(dataset.templateCount);
+        int initStart = max(0, startBucket - config.rollingHorizonBuckets);
+        for (int bucketIndex = initStart; bucketIndex < startBucket; bucketIndex++) {
+            baseline.add(bucketIndex, dataset.buckets.get(bucketIndex));
+        }
+        while (baseline.size() > config.rollingHorizonBuckets) {
+            baseline.removeOldest(dataset);
+        }
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        boolean[] selectedEvents = new boolean[max(1, dataset.templateCount)];
+        List<Integer> selected = new ArrayList<>();
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            Bucket bucket = dataset.buckets.get(bucketIndex);
+            int size = bucket.eventCounts.size();
+            int[] eventIds = new int[size];
+            double[] pValues = new double[size];
+            int index = 0;
+            for (Map.Entry<Integer, Integer> entry : bucket.eventCounts.entrySet()) {
+                eventIds[index] = entry.getKey();
+                pValues[index] = baseline.poissonUpperTail(bucket.totalCount, entry.getKey(), entry.getValue());
+                ++index;
+            }
+            double cutoff = bhCutoff(pValues, q);
+            if (cutoff >= 0.0) {
+                for (int i = 0; i < size; i++) {
+                    if (pValues[i] <= cutoff) {
+                        selectedEvents[eventIds[i]] = true;
+                        selected.add(eventIds[i]);
+                    }
+                }
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean prediction = selectedEvents[dataset.eventIds.values[i]];
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+            }
+            for (int eventId : selected) {
+                selectedEvents[eventId] = false;
+            }
+            selected.clear();
+            baseline.add(bucketIndex, bucket);
+            while (baseline.size() > config.rollingHorizonBuckets) {
+                baseline.removeOldest(dataset);
+            }
+        }
+        return new FdrResult(datasetName, "rolling_template_spike_bh_h" + config.rollingHorizonBuckets, context.name,
+                context.anomalyRate, context.shingleSize, q, baseline.total, contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateSeedExpand(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, double q, int startBucket, int endBucket, double contextLineRecall, Config config) {
+        RollingLineCalibrator calibrator = new RollingLineCalibrator(config.rollingScoreMax, config.rollingBins, false);
+        int initStart = max(0, startBucket - config.rollingHorizonBuckets);
+        for (int bucketIndex = initStart; bucketIndex < startBucket; bucketIndex++) {
+            calibrator.add(bucketScores(dataset, stats, context, bucketIndex, config, false));
+        }
+        while (calibrator.size() > config.rollingHorizonBuckets) {
+            calibrator.removeOldest();
+        }
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        int[] activeEvents = new int[max(1, dataset.templateCount)];
+        List<Integer> touched = new ArrayList<>();
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            ScoreBucket current = bucketScores(dataset, stats, context, bucketIndex, config, false);
+            boolean[] seedEvent = new boolean[activeEvents.length];
+            for (int offset = 0; offset < current.scores.length; offset++) {
+                int lineIndex = current.startLine + offset;
+                double pValue = calibrator.pValue(current.scores[offset], 0);
+                int keyword = dataset.keywordScores.values[lineIndex];
+                boolean strongSeed = keyword >= 8 && pValue <= min(0.05, q * 20.0);
+                boolean scoreSeed = pValue <= q;
+                if (scoreSeed || strongSeed) {
+                    int eventId = dataset.eventIds.values[lineIndex];
+                    if (!seedEvent[eventId]) {
+                        seedEvent[eventId] = true;
+                        touched.add(eventId);
+                    }
+                    activeEvents[eventId] = max(activeEvents[eventId], config.expandBuckets + 1);
+                }
+            }
+            for (int offset = 0; offset < current.scores.length; offset++) {
+                int lineIndex = current.startLine + offset;
+                int eventId = dataset.eventIds.values[lineIndex];
+                boolean prediction = activeEvents[eventId] > 0;
+                metrics.add(dataset.labels.values[lineIndex] != 0, prediction);
+            }
+            calibrator.add(current);
+            while (calibrator.size() > config.rollingHorizonBuckets) {
+                calibrator.removeOldest();
+            }
+            for (int eventId = 0; eventId < activeEvents.length; eventId++) {
+                if (activeEvents[eventId] > 0) {
+                    --activeEvents[eventId];
+                }
+            }
+            for (int eventId : touched) {
+                seedEvent[eventId] = false;
+            }
+            touched.clear();
+        }
+        return new FdrResult(datasetName, "seed_expand_" + config.scoreMode + "_h" + config.rollingHorizonBuckets
+                + "_e" + config.expandBuckets, context.name, context.anomalyRate, context.shingleSize, q,
+                calibrator.totalCount(), contextLineRecall, metrics);
+    }
+
+    private static TailCalibration tailCalibration(Dataset dataset, TrainStats stats, ContextSet context,
+            int startBucket, int endBucket, Config config, boolean conditional) {
+        List<Double>[] byClass = new List[conditional ? 4 : 1];
+        for (int i = 0; i < byClass.length; i++) {
+            byClass[i] = new ArrayList<>();
+        }
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                int scoreClass = conditional ? keywordClass(dataset.keywordScores.values[i]) : 0;
+                byClass[scoreClass].add(lineScore(dataset, stats, context, i, config.scoreMode));
+            }
+        }
+        double[][] sorted = new double[byClass.length][];
+        int total = 0;
+        for (int i = 0; i < byClass.length; i++) {
+            sorted[i] = new double[byClass[i].size()];
+            for (int j = 0; j < sorted[i].length; j++) {
+                sorted[i][j] = byClass[i].get(j);
+            }
+            java.util.Arrays.sort(sorted[i]);
+            total += sorted[i].length;
+        }
+        return new TailCalibration(sorted, total);
+    }
+
+    private static FdrResult evaluateTailExcess(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, TailCalibration calibration, double targetPrecision, int startBucket, int endBucket,
+            double contextLineRecall, Config config, boolean conditional) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int blockStart = startBucket; blockStart < endBucket; blockStart += config.tailBlockBuckets) {
+            int blockEnd = min(endBucket, blockStart + config.tailBlockBuckets);
+            ScoreBlock block = scoreBlock(dataset, stats, context, blockStart, blockEnd, config, conditional);
+            boolean[] predictions = tailExcessPredictions(block, calibration, targetPrecision, config, conditional);
+            for (int i = 0; i < block.scores.length; i++) {
+                metrics.add(dataset.labels.values[block.lineIndexes[i]] != 0, predictions[i]);
+            }
+        }
+        String method = (conditional ? "conditional_tail_excess_" : "tail_excess_") + config.scoreMode
+                + "_b" + config.tailBlockBuckets;
+        return new FdrResult(datasetName, method, context.name, context.anomalyRate, context.shingleSize,
+                targetPrecision, calibration.totalCount, contextLineRecall, metrics);
+    }
+
+    private static FdrResult evaluateTailSeedExpand(String datasetName, Dataset dataset, TrainStats stats,
+            ContextSet context, TailCalibration calibration, double targetPrecision, int startBucket, int endBucket,
+            double contextLineRecall, Config config) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int blockStart = startBucket; blockStart < endBucket; blockStart += config.tailBlockBuckets) {
+            int blockEnd = min(endBucket, blockStart + config.tailBlockBuckets);
+            ScoreBlock block = scoreBlock(dataset, stats, context, blockStart, blockEnd, config, false);
+            boolean[] seeds = tailExcessPredictions(block, calibration, targetPrecision, config, false);
+            Map<Long, List<Integer>> seedBuckets = new HashMap<>();
+            for (int i = 0; i < block.scores.length; i++) {
+                if (seeds[i]) {
+                    int lineIndex = block.lineIndexes[i];
+                    long key = entityEventKey(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex]);
+                    seedBuckets.computeIfAbsent(key, ignored -> new ArrayList<>())
+                            .add(dataset.bucketIndexes.values[lineIndex]);
+                }
+            }
+            for (int i = 0; i < block.scores.length; i++) {
+                int lineIndex = block.lineIndexes[i];
+                long key = entityEventKey(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex]);
+                boolean prediction = false;
+                List<Integer> buckets = seedBuckets.get(key);
+                if (buckets != null) {
+                    int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+                    for (int seedBucket : buckets) {
+                        if (Math.abs(bucketIndex - seedBucket) <= config.expandBuckets) {
+                            prediction = true;
+                            break;
+                        }
+                    }
+                }
+                metrics.add(dataset.labels.values[lineIndex] != 0, prediction);
+            }
+        }
+        String method = "tail_seed_expand_" + config.scoreMode + "_b" + config.tailBlockBuckets + "_e"
+                + config.expandBuckets;
+        return new FdrResult(datasetName, method, context.name, context.anomalyRate, context.shingleSize,
+                targetPrecision, calibration.totalCount, contextLineRecall, metrics);
+    }
+
+    private static ScoreBlock scoreBlock(Dataset dataset, TrainStats stats, ContextSet context, int startBucket,
+            int endBucket, Config config, boolean conditional) {
+        int count = dataset.countLines(startBucket, endBucket);
+        double[] scores = new double[count];
+        int[] classes = new int[count];
+        int[] lineIndexes = new int[count];
+        int index = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                scores[index] = lineScore(dataset, stats, context, i, config.scoreMode);
+                classes[index] = conditional ? keywordClass(dataset.keywordScores.values[i]) : 0;
+                lineIndexes[index] = i;
+                ++index;
+            }
+        }
+        return new ScoreBlock(scores, classes, lineIndexes);
+    }
+
+    private static boolean[] tailExcessPredictions(ScoreBlock block, TailCalibration calibration,
+            double targetPrecision, Config config, boolean conditional) {
+        boolean[] predictions = new boolean[block.scores.length];
+        int classCount = conditional ? calibration.sortedScoresByClass.length : 1;
+        for (int scoreClass = 0; scoreClass < classCount; scoreClass++) {
+            double threshold = tailExcessThreshold(block.scores, block.classes, scoreClass,
+                    calibration.scoresForClass(scoreClass), targetPrecision, config);
+            if (!Double.isFinite(threshold)) {
+                continue;
+            }
+            for (int i = 0; i < block.scores.length; i++) {
+                if ((!conditional || block.classes[i] == scoreClass) && block.scores[i] >= threshold) {
+                    predictions[i] = true;
+                }
+            }
+        }
+        return predictions;
+    }
+
+    private static double tailExcessThreshold(double[] scores, int[] classes, int scoreClass, double[] calibrationScores,
+            double targetPrecision, Config config) {
+        if (calibrationScores.length == 0) {
+            return Double.POSITIVE_INFINITY;
+        }
+        double[] current = new double[scores.length];
+        int count = 0;
+        for (int i = 0; i < scores.length; i++) {
+            if (classes[i] == scoreClass) {
+                current[count++] = scores[i];
+            }
+        }
+        if (count < config.tailMinSelected) {
+            return Double.POSITIVE_INFINITY;
+        }
+        java.util.Arrays.sort(current, 0, count);
+        double threshold = Double.POSITIVE_INFINITY;
+        for (int i = count - 1; i >= 0; i--) {
+            if (i < count - 1 && current[i] == current[i + 1]) {
+                continue;
+            }
+            int selected = count - i;
+            if (selected < config.tailMinSelected) {
+                continue;
+            }
+            double tailProbability = empiricalUpperTailProbability(calibrationScores, current[i]);
+            double expected = selected == 0 ? 0.0 : count * tailProbability;
+            double excess = max(0.0, selected - expected);
+            double precisionHat = excess / selected;
+            double pValue = poissonSurvival(max(1.0e-12, expected), selected);
+            if (precisionHat >= targetPrecision && pValue <= config.tailSignificance) {
+                threshold = current[i];
+            }
+        }
+        return threshold;
+    }
+
+    private static double empiricalUpperTailProbability(double[] sortedScores, double score) {
+        if (sortedScores.length == 0) {
+            return 1.0;
+        }
+        int index = lowerBound(sortedScores, score);
+        return (sortedScores.length - index) / (double) sortedScores.length;
+    }
+
+    private static OracleResult oracleDiagnostic(String datasetName, String scoreName, Dataset dataset, TrainStats stats,
+            ContextSet context, int startBucket, int endBucket, boolean combinedScore) {
+        int count = dataset.countLines(startBucket, endBucket, context);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        LineScorer scorer = combinedScore ? null : scorerByName(scoreName);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            if (!context.candidates[bucketIndex]) {
+                continue;
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean label = dataset.labels.values[i] != 0;
+                double score = combinedScore ? fdrLineScore(dataset, stats, context, i) : scorer.score(dataset, stats, i);
+                packed[index++] = pack(score, label);
+                if (label) {
+                    ++positives;
+                }
+            }
+        }
+        if (index == 0 || positives == 0) {
+            return new OracleResult(datasetName, scoreName, context.name, context.anomalyRate, context.shingleSize, index,
+                    positives, 0, 0, 0, 0, 0, 0, false);
+        }
+        java.util.Arrays.sort(packed, 0, index);
+        long tp = 0;
+        double bestF1 = 0;
+        double bestF1Precision = 0;
+        double bestF1Recall = 0;
+        double bestPrecisionAtRecall50 = 0;
+        double bestRecallAtPrecision50 = 0;
+        double averagePrecisionNumerator = 0;
+        boolean targetFeasible = false;
+        for (int i = 0; i < index; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+                averagePrecisionNumerator += tp / (double) (i + 1L);
+            }
+            double precision = tp / (double) (i + 1L);
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+            if (f1 > bestF1) {
+                bestF1 = f1;
+                bestF1Precision = precision;
+                bestF1Recall = recall;
+            }
+            if (recall >= 0.5) {
+                bestPrecisionAtRecall50 = max(bestPrecisionAtRecall50, precision);
+            }
+            if (precision >= 0.5) {
+                bestRecallAtPrecision50 = max(bestRecallAtPrecision50, recall);
+            }
+            if (precision >= 0.5 && recall >= 0.5) {
+                targetFeasible = true;
+            }
+        }
+        double averagePrecision = averagePrecisionNumerator / positives;
+        return new OracleResult(datasetName, scoreName, context.name, context.anomalyRate, context.shingleSize, index,
+                positives, bestPrecisionAtRecall50, bestRecallAtPrecision50, bestF1, bestF1Precision, bestF1Recall,
+                averagePrecision, targetFeasible);
+    }
+
+    private static OracleResult oracleDiagnosticScoreMode(String datasetName, String scoreMode, Dataset dataset,
+            TrainStats stats, ContextSet context, int startBucket, int endBucket) {
+        if (scoreMode.startsWith("bgl_semantic_online")) {
+            return OracleResult.oracleDiagnosticOnlineSemantic(datasetName, scoreMode, dataset, stats, context,
+                    startBucket, endBucket);
+        }
+        int count = dataset.countLines(startBucket, endBucket, context);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            if (!context.candidates[bucketIndex]) {
+                continue;
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean label = dataset.labels.values[i] != 0;
+                double score = lineScore(dataset, stats, context, i, scoreMode);
+                packed[index++] = pack(score, label);
+                if (label) {
+                    ++positives;
+                }
+            }
+        }
+        if (index == 0 || positives == 0) {
+            return new OracleResult(datasetName, "score_mode_" + scoreMode, context.name, context.anomalyRate,
+                    context.shingleSize, index, positives, 0, 0, 0, 0, 0, 0, false);
+        }
+        java.util.Arrays.sort(packed, 0, index);
+        long tp = 0;
+        double bestF1 = 0;
+        double bestF1Precision = 0;
+        double bestF1Recall = 0;
+        double bestPrecisionAtRecall50 = 0;
+        double bestRecallAtPrecision50 = 0;
+        double averagePrecisionNumerator = 0;
+        boolean targetFeasible = false;
+        for (int i = 0; i < index; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+                averagePrecisionNumerator += tp / (double) (i + 1L);
+            }
+            double precision = tp / (double) (i + 1L);
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+            if (f1 > bestF1) {
+                bestF1 = f1;
+                bestF1Precision = precision;
+                bestF1Recall = recall;
+            }
+            if (recall >= 0.5) {
+                bestPrecisionAtRecall50 = max(bestPrecisionAtRecall50, precision);
+            }
+            if (precision >= 0.5) {
+                bestRecallAtPrecision50 = max(bestRecallAtPrecision50, recall);
+            }
+            if (precision >= 0.5 && recall >= 0.5) {
+                targetFeasible = true;
+            }
+        }
+        double averagePrecision = averagePrecisionNumerator / positives;
+        return new OracleResult(datasetName, "score_mode_" + scoreMode, context.name, context.anomalyRate,
+                context.shingleSize, index, positives, bestPrecisionAtRecall50, bestRecallAtPrecision50, bestF1,
+                bestF1Precision, bestF1Recall, averagePrecision, targetFeasible);
+    }
+
+    private static LineScorer scorerByName(String name) {
+        for (LineScorer scorer : LineScorer.suite()) {
+            if (scorer.name().equals(name)) {
+                return scorer;
+            }
+        }
+        throw new IllegalArgumentException(name);
+    }
+
+    private static double fdrLineScore(Dataset dataset, TrainStats stats, ContextSet context, int lineIndex) {
+        int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        Bucket bucket = dataset.buckets.get(bucketIndex);
+        double globalRarity = stats.globalRarity(eventId);
+        double entityRarity = stats.entityRarity(entityId, eventId);
+        double rarity = min(entityRarity, globalRarity + 2.0);
+        double spike = Math.log1p(templateSpike(bucket, stats, eventId));
+        double entitySpike = Math.log1p(entityTemplateSpike(bucket, stats, entityId, eventId));
+        double parameter = stats.parameterRarity(entityId, eventId, dataset.parameterHashes.values[lineIndex]);
+        double transition = min(12.0, stats.transitionSurprise(dataset.prevEventIds.values[lineIndex], eventId));
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double keywordBoost = keyword >= 8 ? 12.0 : keyword >= 4 ? 3.0 : 0.0;
+        if (keyword == 1 && (rarity >= 8.0 || spike >= 2.0 || entitySpike >= 2.0 || parameter >= 6.0
+                || context.isPositive(bucketIndex))) {
+            keywordBoost = 0.6;
+        }
+        double contextBoost = context.isPositive(bucketIndex) ? 1.5 : 0.0;
+        return rarity + keywordBoost + 1.0 * spike + 1.2 * entitySpike + 0.35 * parameter + 0.25 * transition
+                + contextBoost;
+    }
+
+    private static double lineScore(Dataset dataset, TrainStats stats, ContextSet context, int lineIndex,
+            String scoreMode) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int keyword = dataset.keywordScores.values[lineIndex];
+        switch (scoreMode) {
+        case "rarity_keyword":
+            return stats.entityRarity(entityId, eventId) + 3.0 * keyword;
+        case "global_rarity_keyword":
+            return stats.globalRarity(eventId) + 3.0 * keyword;
+        case "global_rarity_keyword_tiebreak":
+            return stats.globalRarity(eventId) + 3.0 * keyword
+                    + 1.0e-3 * bglTieBreakScore(dataset, stats, context, lineIndex);
+        case "rarity_keyword_tiebreak":
+            return stats.entityRarity(entityId, eventId) + 3.0 * keyword
+                    + 1.0e-3 * bglTieBreakScore(dataset, stats, context, lineIndex);
+        case "global_rarity_keyword_gated":
+            return stats.globalRarity(eventId)
+                    + gatedKeywordBoost(keyword, stats.globalRarity(eventId), 0.0, 0.0,
+                            context.isPositive(dataset.bucketIndexes.values[lineIndex]));
+        case "global_rarity_keyword_context":
+            return stats.globalRarity(eventId) + 3.0 * keyword + (context.isPositive(dataset.bucketIndexes.values[lineIndex]) ? 2.0 : 0.0);
+        case "global_entity_param":
+            return bglFeatureScore(dataset, stats, context, lineIndex, false, true, false);
+        case "global_entity_spike":
+            return bglFeatureScore(dataset, stats, context, lineIndex, false, false, true);
+        case "bgl_rank":
+            return bglFeatureScore(dataset, stats, context, lineIndex, false, true, true);
+        case "bgl_rank_gated":
+            return bglFeatureScore(dataset, stats, context, lineIndex, true, true, true);
+        case "bgl_semantic":
+            return bglSemanticScore(dataset, stats, context, lineIndex, true, true, false, null);
+        case "bgl_semantic_no_suppress":
+            return bglSemanticScore(dataset, stats, context, lineIndex, true, false, false, null);
+        case "bgl_semantic_no_phrase":
+            return bglSemanticScore(dataset, stats, context, lineIndex, false, true, false, null);
+        case "bgl_semantic_online":
+        case "bgl_semantic_online_no_suppress":
+        case "bgl_semantic_online_no_phrase":
+            return bglSemanticScore(dataset, stats, context, lineIndex, !scoreMode.endsWith("_no_phrase"),
+                    !scoreMode.endsWith("_no_suppress"), false, null);
+        case "keyword":
+            return keyword;
+        case "global_rarity":
+            return stats.globalRarity(eventId);
+        case "rarity":
+            return stats.entityRarity(entityId, eventId);
+        case "combined":
+            return fdrLineScore(dataset, stats, context, lineIndex);
+        default:
+            throw new IllegalArgumentException("unknown score mode " + scoreMode);
+        }
+    }
+
+    private static double bglSemanticScore(Dataset dataset, TrainStats stats, ContextSet context, int lineIndex,
+            boolean includePhrase, boolean includeStableSuppression, boolean online, OnlineSemanticStats onlineStats) {
+        int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        int levelId = dataset.levelIds.values[lineIndex];
+        int phraseHash = dataset.phraseHashes.values[lineIndex];
+        int parameterHash = dataset.parameterHashes.values[lineIndex];
+        Bucket bucket = dataset.buckets.get(bucketIndex);
+        double templateRarity = stats.globalRarity(eventId);
+        double signatureRarity = online
+                ? onlineStats.semanticSignatureRarity(componentId, levelId, phraseHash)
+                : stats.semanticSignatureRarity(componentId, levelId, phraseHash);
+        double phraseRarity = includePhrase
+                ? (online ? onlineStats.phraseRarity(phraseHash) : stats.phraseRarity(phraseHash))
+                : 0.0;
+        double parameter = stats.parameterRarity(entityId, eventId, parameterHash);
+        double entitySpike = Math.log1p(entityTemplateSpike(bucket, stats, entityId, eventId));
+        double stableSuppression = includeStableSuppression
+                ? (online ? onlineStats.stableSignatureSuppression(componentId, levelId, phraseHash)
+                        : stats.stableSignatureSuppression(componentId, levelId, phraseHash, 20, 5, 8.0))
+                : 0.0;
+        double noveltyGate = max(max(gate(signatureRarity, 3.0, 10.0), gate(phraseRarity, 3.0, 10.0)),
+                max(gate(parameter, 3.0, 10.0), gate(entitySpike, 0.4, 3.0)));
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double keywordBoost = keyword >= 8 ? 10.0 * noveltyGate
+                : keyword >= 4 ? 4.0 * noveltyGate : keyword > 0 ? 0.5 * noveltyGate : 0.0;
+        double contextBoost = context.isPositive(bucketIndex) ? 1.0 : 0.0;
+        return 0.5 * templateRarity + 1.4 * signatureRarity + 1.2 * phraseRarity + 0.7 * parameter
+                + 0.8 * entitySpike + keywordBoost + contextBoost - 1.8 * stableSuppression;
+    }
+
+    private static double gate(double value, double low, double high) {
+        if (value <= low) {
+            return 0.0;
+        }
+        if (value >= high) {
+            return 1.0;
+        }
+        return (value - low) / (high - low);
+    }
+
+    private static double bglTieBreakScore(Dataset dataset, TrainStats stats, ContextSet context, int lineIndex) {
+        int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        Bucket bucket = dataset.buckets.get(bucketIndex);
+        double entityRarity = stats.entityRarity(entityId, eventId);
+        double componentRarity = stats.componentRarity(dataset.componentIds.values[lineIndex], eventId);
+        double entityGivenTemplate = stats.entityGivenTemplateRarity(entityId, eventId);
+        double parameter = stats.parameterRarity(entityId, eventId, dataset.parameterHashes.values[lineIndex]);
+        double entitySpike = Math.log1p(entityTemplateSpike(bucket, stats, entityId, eventId));
+        double transition = min(12.0, stats.transitionSurprise(dataset.prevEventIds.values[lineIndex], eventId));
+        double contextBoost = context.isPositive(bucketIndex) ? 2.0 : 0.0;
+        return entityRarity + 0.5 * componentRarity + 0.5 * entityGivenTemplate + 0.5 * parameter
+                + 2.0 * entitySpike + 0.25 * transition + contextBoost;
+    }
+
+    private static double gatedKeywordBoost(int keyword, double rarity, double parameter, double spike,
+            boolean contextPositive) {
+        if (keyword >= 8) {
+            return 18.0;
+        }
+        if (keyword >= 4) {
+            return 8.0;
+        }
+        if (keyword > 0 && (rarity >= 7.0 || parameter >= 5.0 || spike >= 1.5 || contextPositive)) {
+            return 1.0;
+        }
+        return 0.0;
+    }
+
+    private static double bglFeatureScore(Dataset dataset, TrainStats stats, ContextSet context, int lineIndex,
+            boolean gateWeakKeywords, boolean includeParameter, boolean includeEntitySpike) {
+        int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        Bucket bucket = dataset.buckets.get(bucketIndex);
+        double globalRarity = stats.globalRarity(eventId);
+        double entityRarity = stats.entityRarity(entityId, eventId);
+        double componentRarity = stats.componentRarity(componentId, eventId);
+        double entityGivenTemplate = stats.entityGivenTemplateRarity(entityId, eventId);
+        double parameter = includeParameter
+                ? stats.parameterRarity(entityId, eventId, dataset.parameterHashes.values[lineIndex])
+                : 0.0;
+        double entitySpike = includeEntitySpike ? Math.log1p(entityTemplateSpike(bucket, stats, entityId, eventId)) : 0.0;
+        double globalSpike = Math.log1p(templateSpike(bucket, stats, eventId));
+        double transition = min(12.0, stats.transitionSurprise(dataset.prevEventIds.values[lineIndex], eventId));
+        double entityExcess = max(0.0, min(entityRarity, componentRarity) - globalRarity);
+        double evidence = max(max(globalRarity, entityRarity), max(parameter, max(entitySpike, globalSpike)));
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double keywordBoost;
+        if (keyword >= 8) {
+            keywordBoost = 9.0;
+        } else if (keyword >= 4) {
+            keywordBoost = gateWeakKeywords ? 4.0 : 8.0;
+        } else if (keyword > 0) {
+            keywordBoost = !gateWeakKeywords || evidence >= 7.0 || entityGivenTemplate >= 4.0
+                    || context.isPositive(bucketIndex) ? 0.8 : 0.0;
+        } else {
+            keywordBoost = 0.0;
+        }
+        double contextBoost = context.isPositive(bucketIndex) ? 1.0 : 0.0;
+        return globalRarity + 0.55 * entityExcess + 0.35 * min(12.0, entityGivenTemplate)
+                + 0.55 * parameter + 1.7 * entitySpike + 0.8 * globalSpike + 0.15 * transition + keywordBoost
+                + contextBoost;
+    }
+
+    private static double fdrCellScore(Bucket bucket, TrainStats stats, ContextSet context, int bucketIndex,
+            int eventId) {
+        double rarity = stats.globalRarity(eventId);
+        double spike = Math.log1p(templateSpike(bucket, stats, eventId));
+        int keyword = bucket.maxKeywordByEvent.getOrDefault(eventId, (byte) 0);
+        double keywordBoost = keyword >= 8 ? 10.0 : keyword >= 4 ? 3.0 : keyword == 1 && (rarity >= 8.0 || spike >= 2.0)
+                ? 0.6
+                : 0.0;
+        double contextBoost = context.isPositive(bucketIndex) ? 1.5 : 0.0;
+        return rarity + keywordBoost + 2.0 * spike + contextBoost;
+    }
+
+    private static double templateSpike(Bucket bucket, TrainStats stats, int eventId) {
+        double expected = bucket.totalCount * stats.globalRate(eventId);
+        double observed = bucket.eventCounts.getOrDefault(eventId, 0);
+        return max(0.0, (observed - expected) / Math.sqrt(expected + 1.0));
+    }
+
+    private static double entityTemplateSpike(Bucket bucket, TrainStats stats, int entityId, int eventId) {
+        if (bucket.entityCounts == null || bucket.entityEventCounts == null) {
+            return 0.0;
+        }
+        int entityBucketTotal = bucket.entityCounts.getOrDefault(entityId, 0);
+        if (entityBucketTotal <= 0) {
+            return 0.0;
+        }
+        double entityTotal = stats.entityTotals.getOrDefault(entityId, 0);
+        double probability = entityTotal <= 0.0 ? stats.globalRate(eventId)
+                : stats.entityEventCount(entityId, eventId) / entityTotal;
+        double expected = entityBucketTotal * probability;
+        int observed = bucket.entityEventCounts.getOrDefault(entityEventKey(entityId, eventId), 0);
+        return max(0.0, (observed - expected) / Math.sqrt(expected + 1.0));
+    }
+
+    private static double empiricalUpperTailPValue(double[] sortedScores, double score) {
+        if (sortedScores.length == 0) {
+            return 1.0;
+        }
+        int index = lowerBound(sortedScores, score);
+        return (sortedScores.length - index + 1.0) / (sortedScores.length + 1.0);
+    }
+
+    private static double quantile(double[] sortedScores, double quantile) {
+        if (sortedScores.length == 0) {
+            return Double.POSITIVE_INFINITY;
+        }
+        double clean = max(0.0, min(1.0, quantile));
+        int index = (int) Math.ceil(clean * sortedScores.length) - 1;
+        return sortedScores[min(max(index, 0), sortedScores.length - 1)];
+    }
+
+    private static int lowerBound(double[] values, double target) {
+        int low = 0;
+        int high = values.length;
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (values[middle] < target) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    private static double bhCutoff(double[] pValues, double q) {
+        double[] sorted = java.util.Arrays.copyOf(pValues, pValues.length);
+        java.util.Arrays.sort(sorted);
+        double cutoff = -1.0;
+        for (int i = 0; i < sorted.length; i++) {
+            if (sorted[i] <= q * (i + 1.0) / sorted.length) {
+                cutoff = sorted[i];
+            }
+        }
+        return cutoff;
+    }
+
+    private static long anomalousLines(Dataset dataset, int startBucket, int endBucket) {
+        long count = 0;
+        for (int i = 0; i < dataset.labels.size; i++) {
+            int bucketIndex = dataset.bucketIndexes.values[i];
+            if (bucketIndex >= startBucket && bucketIndex < endBucket && dataset.labels.values[i] != 0) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    private static long coveredAnomalousLines(Dataset dataset, ContextSet context, int startBucket, int endBucket) {
+        long count = 0;
+        for (int i = 0; i < dataset.labels.size; i++) {
+            int bucketIndex = dataset.bucketIndexes.values[i];
+            if (bucketIndex >= startBucket && bucketIndex < endBucket && context.candidates[bucketIndex]
+                    && dataset.labels.values[i] != 0) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    private static double contextLineRecall(Dataset dataset, ContextSet context, int startBucket, int endBucket) {
+        if (context.isUngated()) {
+            return 1.0;
+        }
+        long anomalies = anomalousLines(dataset, startBucket, endBucket);
+        return anomalies == 0 ? 0.0 : coveredAnomalousLines(dataset, context, startBucket, endBucket) / (double) anomalies;
+    }
+
+    private static long pack(double score, boolean label) {
+        double clean = Double.isFinite(score) ? max(0.0, score) : Double.MAX_VALUE;
+        long bits = Double.doubleToRawLongBits(clean);
+        long key = Long.MAX_VALUE - bits;
+        return (key & ~1L) | (label ? 1L : 0L);
+    }
+
+    private static double unpackScore(long packed) {
+        long key = packed & ~1L;
+        long bits = Long.MAX_VALUE - key;
+        return Double.longBitsToDouble(bits);
+    }
+
+    private static void writeResults(String output, List<Result> results) throws IOException {
+        Path path = Paths.get(output);
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(Result.header());
+            writer.newLine();
+            for (Result result : results) {
+                writer.write(result.toCsv());
+                writer.newLine();
+            }
+        }
+    }
+
+    private static void writeFdrResults(String output, List<FdrResult> results) throws IOException {
+        Path path = Paths.get(output);
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(FdrResult.header());
+            writer.newLine();
+            for (FdrResult result : results) {
+                writer.write(result.toCsv());
+                writer.newLine();
+            }
+        }
+    }
+
+    private static void writeOracleResults(String output, List<OracleResult> results) throws IOException {
+        Path path = Paths.get(output);
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(OracleResult.header());
+            writer.newLine();
+            for (OracleResult result : results) {
+                writer.write(result.toCsv());
+                writer.newLine();
+            }
+        }
+    }
+
+    private static void writeTemplateDiagnostics(String output, List<TemplateDiagnostic> results) throws IOException {
+        Path path = Paths.get(output);
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(TemplateDiagnostic.header());
+            writer.newLine();
+            for (TemplateDiagnostic result : results) {
+                writer.write(result.toCsv());
+                writer.newLine();
+            }
+        }
+    }
+
+    private static void printSummary(List<Result> results, int top) {
+        List<Result> sorted = new ArrayList<>(results);
+        sorted.sort((a, b) -> Double.compare(b.metrics.f1(), a.metrics.f1()));
+        System.out.println(Result.header());
+        for (int i = 0; i < min(top, sorted.size()); i++) {
+            System.out.println(sorted.get(i).toCsv());
+        }
+    }
+
+    private static void printFdrSummary(List<FdrResult> results, int top) {
+        List<FdrResult> sorted = new ArrayList<>(results);
+        sorted.sort((a, b) -> Double.compare(b.metrics.f1(), a.metrics.f1()));
+        System.out.println(FdrResult.header());
+        for (int i = 0; i < min(top, sorted.size()); i++) {
+            System.out.println(sorted.get(i).toCsv());
+        }
+    }
+
+    private static void printOracleSummary(List<OracleResult> results, int top) {
+        List<OracleResult> sorted = new ArrayList<>(results);
+        sorted.sort((a, b) -> Double.compare(b.bestF1, a.bestF1));
+        System.out.println(OracleResult.header());
+        for (int i = 0; i < min(top, sorted.size()); i++) {
+            System.out.println(sorted.get(i).toCsv());
+        }
+    }
+
+    private static void printTemplateDiagnostics(List<TemplateDiagnostic> results, int top) {
+        System.out.println(TemplateDiagnostic.header());
+        for (int i = 0; i < min(top, results.size()); i++) {
+            System.out.println(results.get(i).toCsv());
+        }
+    }
+
+    private interface LineScorer {
+        String name();
+
+        double score(Dataset dataset, TrainStats stats, int lineIndex);
+
+        static List<LineScorer> suite() {
+            List<LineScorer> scorers = new ArrayList<>();
+            scorers.add(new BaseScorer("rarity") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.entityRarity(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex]);
+                }
+            });
+            scorers.add(new BaseScorer("global_rarity") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.globalRarity(dataset.eventIds.values[lineIndex]);
+                }
+            });
+            scorers.add(new BaseScorer("oov") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.entityEventCount(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex]) == 0
+                            ? 1.0
+                            : 0.0;
+                }
+            });
+            scorers.add(new BaseScorer("spike") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+                    int eventId = dataset.eventIds.values[lineIndex];
+                    Bucket bucket = dataset.buckets.get(bucketIndex);
+                    double expected = bucket.totalCount * stats.globalRate(eventId);
+                    double observed = bucket.eventCounts.getOrDefault(eventId, 0);
+                    return max(0.0, (observed - expected) / Math.sqrt(expected + 1.0));
+                }
+            });
+            scorers.add(new BaseScorer("transition") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.transitionSurprise(dataset.prevEventIds.values[lineIndex], dataset.eventIds.values[lineIndex]);
+                }
+            });
+            scorers.add(new BaseScorer("keyword") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return dataset.keywordScores.values[lineIndex];
+                }
+            });
+            scorers.add(new BaseScorer("rarity_keyword") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.entityRarity(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex])
+                            + 3.0 * dataset.keywordScores.values[lineIndex];
+                }
+            });
+            scorers.add(new BaseScorer("global_rarity_keyword") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    return stats.globalRarity(dataset.eventIds.values[lineIndex])
+                            + 3.0 * dataset.keywordScores.values[lineIndex];
+                }
+            });
+            scorers.add(new BaseScorer("rarity_spike") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+                    int eventId = dataset.eventIds.values[lineIndex];
+                    Bucket bucket = dataset.buckets.get(bucketIndex);
+                    double expected = bucket.totalCount * stats.globalRate(eventId);
+                    double observed = bucket.eventCounts.getOrDefault(eventId, 0);
+                    double spike = max(0.0, (observed - expected) / Math.sqrt(expected + 1.0));
+                    return stats.entityRarity(dataset.entityIds.values[lineIndex], eventId) + spike;
+                }
+            });
+            scorers.add(new BaseScorer("ensemble") {
+                @Override
+                public double score(Dataset dataset, TrainStats stats, int lineIndex) {
+                    double rarity = stats.entityRarity(dataset.entityIds.values[lineIndex], dataset.eventIds.values[lineIndex]);
+                    double transition = stats.transitionSurprise(dataset.prevEventIds.values[lineIndex],
+                            dataset.eventIds.values[lineIndex]);
+                    int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+                    int eventId = dataset.eventIds.values[lineIndex];
+                    Bucket bucket = dataset.buckets.get(bucketIndex);
+                    double expected = bucket.totalCount * stats.globalRate(eventId);
+                    double spike = max(0.0,
+                            (bucket.eventCounts.getOrDefault(eventId, 0) - expected) / Math.sqrt(expected + 1.0));
+                    double oov = stats.entityEventCount(dataset.entityIds.values[lineIndex], eventId) == 0 ? 10.0 : 0.0;
+                    double keyword = 3.0 * dataset.keywordScores.values[lineIndex];
+                    return max(max(rarity, transition), max(max(spike, oov), keyword));
+                }
+            });
+            return scorers;
+        }
+    }
+
+    private abstract static class BaseScorer implements LineScorer {
+        private final String name;
+
+        private BaseScorer(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+    }
+
+    private static final class ContextSet {
+        private final String name;
+        private final boolean[] candidates;
+        private final double anomalyRate;
+        private final int shingleSize;
+
+        private ContextSet(String name, boolean[] candidates, double anomalyRate, int shingleSize) {
+            this.name = name;
+            this.candidates = candidates;
+            this.anomalyRate = anomalyRate;
+            this.shingleSize = shingleSize;
+        }
+
+        private static ContextSet all(String name, int size) {
+            boolean[] candidates = new boolean[size];
+            java.util.Arrays.fill(candidates, true);
+            return new ContextSet(name, candidates, 1.0, 1);
+        }
+
+        private boolean isUngated() {
+            return anomalyRate >= 1.0;
+        }
+
+        private boolean isPositive(int bucketIndex) {
+            return !isUngated() && candidates[bucketIndex];
+        }
+
+        private static ContextSet trcf(Dataset dataset, TrainStats stats, int trainEnd, double anomalyRate,
+                int shingleSize, Config config) {
+            double[][] vectors = new double[dataset.buckets.size()][];
+            for (int i = 0; i < dataset.buckets.size(); i++) {
+                vectors[i] = vectorize(dataset.buckets.get(i), stats, config.topK);
+            }
+            ThresholdedRandomCutForest forest = ThresholdedRandomCutForest.builder()
+                    .dimensions(vectors[0].length * shingleSize).shingleSize(shingleSize)
+                    .numberOfTrees(config.numberOfTrees).sampleSize(config.sampleSize).outputAfter(config.outputAfter)
+                    .randomSeed(config.seed).anomalyRate(anomalyRate).autoAdjust(true).zFactor(config.zFactor)
+                    .transformMethod(TransformMethod.NONE).scoringStrategy(ScoringStrategy.EXPECTED_INVERSE_DEPTH)
+                    .build();
+            boolean[] candidates = new boolean[dataset.buckets.size()];
+            for (int i = 0; i < vectors.length; i++) {
+                AnomalyDescriptor result = forest.process(vectors[i], i);
+                if (i >= trainEnd && result.getAnomalyGrade() > 0.0) {
+                    candidates[i] = true;
+                }
+            }
+            return new ContextSet(String.format(Locale.ROOT, "trcf_global_rate%.3f_shingle%d", anomalyRate,
+                    shingleSize), candidates, anomalyRate, shingleSize);
+        }
+    }
+
+    private static double[] vectorize(Bucket bucket, TrainStats stats, int topK) {
+        double[] evidence = evidenceVector(bucket, stats);
+        double[] vector = new double[topK + 1 + evidence.length];
+        int other = 0;
+        for (Map.Entry<Integer, Integer> entry : bucket.eventCounts.entrySet()) {
+            Integer index = stats.topEventIndex.get(entry.getKey());
+            if (index != null && index < topK) {
+                vector[index] = Math.log1p(entry.getValue());
+            } else {
+                other += entry.getValue();
+            }
+        }
+        vector[topK] = Math.log1p(other);
+        System.arraycopy(evidence, 0, vector, topK + 1, evidence.length);
+        return vector;
+    }
+
+    private static double[] evidenceVector(Bucket bucket, TrainStats stats) {
+        int total = bucket.totalCount;
+        int rare = 0;
+        int oov = 0;
+        int dominant = 0;
+        double maxRarity = 0.0;
+        double sumRarity = 0.0;
+        double clippedRarity = 0.0;
+        double entropy = 0.0;
+        double topShift = 0.0;
+        List<RarityCount> rarityCounts = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> entry : bucket.eventCounts.entrySet()) {
+            int eventId = entry.getKey();
+            int count = entry.getValue();
+            dominant = max(dominant, count);
+            if (!stats.globalCounts.containsKey(eventId)) {
+                oov += count;
+            }
+            if (stats.rareEvents.contains(eventId)) {
+                rare += count;
+            }
+            double rarity = stats.globalRarity(eventId);
+            rarityCounts.add(new RarityCount(rarity, count));
+            maxRarity = max(maxRarity, rarity);
+            sumRarity += rarity * count;
+            clippedRarity += min(20.0, rarity) * count;
+            double p = total == 0 ? 0.0 : count / (double) total;
+            if (p > 0.0) {
+                entropy -= p * Math.log(p);
+            }
+        }
+        for (Map.Entry<Integer, Integer> entry : stats.topEventIndex.entrySet()) {
+            if (entry.getValue() < 50) {
+                int eventId = entry.getKey();
+                double bucketRate = total == 0 ? 0.0 : bucket.eventCounts.getOrDefault(eventId, 0) / (double) total;
+                topShift += Math.abs(bucketRate - stats.globalRate(eventId));
+            }
+        }
+        return new double[] { Math.log1p(total), Math.log1p(bucket.eventCounts.size()), Math.log1p(rare),
+                Math.log1p(oov), total == 0 ? 0.0 : rare / (double) total,
+                total == 0 ? 0.0 : oov / (double) total, maxRarity, total == 0 ? 0.0 : sumRarity / total,
+                weightedQuantile(rarityCounts, total, 0.95), weightedQuantile(rarityCounts, total, 0.99),
+                Math.log1p(clippedRarity), entropy, total == 0 ? 0.0 : dominant / (double) total, topShift };
+    }
+
+    private static double weightedQuantile(List<RarityCount> values, int total, double quantile) {
+        if (total <= 0 || values.isEmpty()) {
+            return 0.0;
+        }
+        values.sort(Comparator.comparingDouble(value -> value.rarity));
+        int target = max(1, (int) Math.ceil(total * quantile));
+        int seen = 0;
+        for (RarityCount value : values) {
+            seen += value.count;
+            if (seen >= target) {
+                return value.rarity;
+            }
+        }
+        return values.get(values.size() - 1).rarity;
+    }
+
+    private static final class Dataset {
+        private final List<Bucket> buckets = new ArrayList<>();
+        private final IntList bucketIndexes = new IntList();
+        private final IntList eventIds = new IntList();
+        private final IntList entityIds = new IntList();
+        private final IntList componentIds = new IntList();
+        private final IntList levelIds = new IntList();
+        private final IntList prevEventIds = new IntList();
+        private final IntList parameterHashes = new IntList();
+        private final IntList phraseHashes = new IntList();
+        private final ByteList keywordScores = new ByteList();
+        private final ByteList labels = new ByteList();
+        private final List<String> lineMessages = new ArrayList<>();
+        private final List<String> entityNames = new ArrayList<>();
+        private final List<String> componentNames = new ArrayList<>();
+        private final List<String> levelNames = new ArrayList<>();
+        private String[] templateTexts = new String[0];
+        private int[] lineStarts;
+        private int templateCount;
+
+        private static Dataset load(String datasetName, String input, int sampleModulo, Config config)
+                throws IOException {
+            System.out.printf(Locale.ROOT, "loading dataset=%s input=%s bucket_seconds=%d sample_modulo=%d%n",
+                    datasetName, input, config.bucketSeconds, sampleModulo);
+            Dataset dataset = new Dataset();
+            SimpleDrainParser parser = new SimpleDrainParser(config.drainSimilarity);
+            Map<String, Integer> entityIds = new HashMap<>();
+            Map<String, Integer> componentIds = new HashMap<>();
+            Map<String, Integer> levelIds = new HashMap<>();
+            Map<Integer, Integer> lastEventByEntity = new HashMap<>();
+            Bucket current = null;
+            long originalLine = 0;
+            try (BufferedReader reader = Files.newBufferedReader(Paths.get(input), RAW_LOG_CHARSET)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    ++originalLine;
+                    if (sampleModulo > 1 && positiveHash(Long.toString(originalLine)) % sampleModulo != 0) {
+                        continue;
+                    }
+                    ParsedLine parsed = parseBglLikeLine(line);
+                    if (parsed == null || parsed.message.isEmpty()) {
+                        continue;
+                    }
+                    long bucketKey = Math.floorDiv(parsed.epochSeconds, config.bucketSeconds);
+                    if (current == null || current.bucketKey != bucketKey) {
+                        current = new Bucket(bucketKey);
+                        dataset.buckets.add(current);
+                    }
+                    int bucketIndex = dataset.buckets.size() - 1;
+                    int entityId = internId(parsed.entity, entityIds, dataset.entityNames);
+                    int componentId = internId(parsed.component, componentIds, dataset.componentNames);
+                    int levelId = internId(parsed.level, levelIds, dataset.levelNames);
+                    int eventId = parser.parse(normalize(parsed.message));
+                    int parameterHash = parameterHash(parsed.message);
+                    int phraseHash = semanticPhraseHash(parsed.message);
+                    int prevEventId = lastEventByEntity.getOrDefault(entityId, -1);
+                    lastEventByEntity.put(entityId, eventId);
+                    current.add(eventId, entityId, parsed.label, parsed.keywordScore, config.useEntityBucketCounts());
+                    dataset.bucketIndexes.add(bucketIndex);
+                    dataset.eventIds.add(eventId);
+                    dataset.entityIds.add(entityId);
+                    dataset.componentIds.add(componentId);
+                    dataset.levelIds.add(levelId);
+                    dataset.prevEventIds.add(prevEventId);
+                    dataset.parameterHashes.add(parameterHash);
+                    dataset.phraseHashes.add(phraseHash);
+                    dataset.keywordScores.add(parsed.keywordScore);
+                    dataset.labels.add((byte) (parsed.label ? 1 : 0));
+                    if (config.storeLineMessages()) {
+                        dataset.lineMessages.add(parsed.message);
+                    }
+                    if (dataset.labels.size % config.progressInterval == 0) {
+                        System.out.printf(Locale.ROOT, "  %s sampled_lines=%d original=%d buckets=%d templates=%d%n",
+                                datasetName, dataset.labels.size, originalLine, dataset.buckets.size(),
+                                parser.templateCount());
+                    }
+                }
+            }
+            dataset.templateCount = parser.templateCount();
+            dataset.templateTexts = parser.templates();
+            dataset.buildLineStarts();
+            System.out.printf(Locale.ROOT,
+                    "loaded dataset=%s lines=%d buckets=%d templates=%d anomalous_lines=%d entities=%d components=%d levels=%d%n", datasetName,
+                    dataset.labels.size, dataset.buckets.size(), dataset.templateCount, dataset.labels.sum(),
+                    entityIds.size(), componentIds.size(), levelIds.size());
+            return dataset;
+        }
+
+        private static int internId(String value, Map<String, Integer> ids, List<String> names) {
+            Integer existing = ids.get(value);
+            if (existing != null) {
+                return existing;
+            }
+            int id = ids.size();
+            ids.put(value, id);
+            names.add(value);
+            return id;
+        }
+
+        private void buildLineStarts() {
+            lineStarts = new int[buckets.size() + 1];
+            int line = 0;
+            for (int bucketIndex = 0; bucketIndex < buckets.size(); bucketIndex++) {
+                lineStarts[bucketIndex] = line;
+                while (line < labels.size && bucketIndexes.values[line] == bucketIndex) {
+                    ++line;
+                }
+            }
+            lineStarts[buckets.size()] = labels.size;
+        }
+
+        private int countLines(int startBucket, int endBucket) {
+            if (lineStarts == null || startBucket < 0 || endBucket > buckets.size() || endBucket < startBucket) {
+                return 0;
+            }
+            return lineStarts[endBucket] - lineStarts[startBucket];
+        }
+
+        private int countLines(int startBucket, int endBucket, ContextSet context) {
+            int count = 0;
+            for (int i = 0; i < labels.size; i++) {
+                int bucketIndex = bucketIndexes.values[i];
+                if (bucketIndex >= startBucket && bucketIndex < endBucket && context.candidates[bucketIndex]) {
+                    ++count;
+                }
+            }
+            return count;
+        }
+    }
+
+    private static final class TrainStats {
+        private final Map<Integer, Integer> globalCounts;
+        private final Map<Long, Integer> entityEventCounts;
+        private final Map<Integer, Integer> entityTotals;
+        private final Map<Long, Integer> componentEventCounts;
+        private final Map<Integer, Integer> componentTotals;
+        private final Map<Long, Integer> templateParameterCounts;
+        private final Map<Long, Integer> entityParameterCounts;
+        private final Map<Integer, Integer> parameterCounts;
+        private final Map<Long, Integer> semanticSignatureCounts;
+        private final Map<Long, Integer> semanticSignatureBucketCounts;
+        private final Map<Long, Integer> componentLevelTotals;
+        private final Map<Integer, Integer> phraseCounts;
+        private final Map<Long, Integer> transitionCounts;
+        private final Map<Integer, Integer> prevTotals;
+        private final Set<Integer> rareEvents;
+        private final Map<Integer, Integer> topEventIndex;
+        private final int globalTotal;
+        private final int vocabularySize;
+        private final int entityCount;
+        private final int componentCount;
+        private final int parameterVocabularySize;
+        private final int semanticSignatureVocabularySize;
+        private final int phraseVocabularySize;
+
+        private TrainStats(Map<Integer, Integer> globalCounts, Map<Long, Integer> entityEventCounts,
+                Map<Integer, Integer> entityTotals, Map<Long, Integer> componentEventCounts,
+                Map<Integer, Integer> componentTotals, Map<Long, Integer> templateParameterCounts,
+                Map<Long, Integer> entityParameterCounts, Map<Integer, Integer> parameterCounts,
+                Map<Long, Integer> semanticSignatureCounts, Map<Long, Integer> semanticSignatureBucketCounts,
+                Map<Long, Integer> componentLevelTotals, Map<Integer, Integer> phraseCounts,
+                Map<Long, Integer> transitionCounts, Map<Integer, Integer> prevTotals, Set<Integer> rareEvents,
+                Map<Integer, Integer> topEventIndex, int globalTotal, int vocabularySize, int entityCount,
+                int componentCount, int parameterVocabularySize, int semanticSignatureVocabularySize,
+                int phraseVocabularySize) {
+            this.globalCounts = globalCounts;
+            this.entityEventCounts = entityEventCounts;
+            this.entityTotals = entityTotals;
+            this.componentEventCounts = componentEventCounts;
+            this.componentTotals = componentTotals;
+            this.templateParameterCounts = templateParameterCounts;
+            this.entityParameterCounts = entityParameterCounts;
+            this.parameterCounts = parameterCounts;
+            this.semanticSignatureCounts = semanticSignatureCounts;
+            this.semanticSignatureBucketCounts = semanticSignatureBucketCounts;
+            this.componentLevelTotals = componentLevelTotals;
+            this.phraseCounts = phraseCounts;
+            this.transitionCounts = transitionCounts;
+            this.prevTotals = prevTotals;
+            this.rareEvents = rareEvents;
+            this.topEventIndex = topEventIndex;
+            this.globalTotal = globalTotal;
+            this.vocabularySize = vocabularySize;
+            this.entityCount = entityCount;
+            this.componentCount = componentCount;
+            this.parameterVocabularySize = parameterVocabularySize;
+            this.semanticSignatureVocabularySize = semanticSignatureVocabularySize;
+            this.phraseVocabularySize = phraseVocabularySize;
+        }
+
+        private static TrainStats from(Dataset dataset, int trainEnd, Config config) {
+            return fromRange(dataset, 0, trainEnd, config);
+        }
+
+        private static TrainStats fromRange(Dataset dataset, int startBucket, int endBucket, Config config) {
+            Map<Integer, Integer> globalCounts = new HashMap<>();
+            Map<Long, Integer> entityEventCounts = new HashMap<>();
+            Map<Integer, Integer> entityTotals = new HashMap<>();
+            Map<Long, Integer> componentEventCounts = new HashMap<>();
+            Map<Integer, Integer> componentTotals = new HashMap<>();
+            Map<Long, Integer> templateParameterCounts = config.useParameterFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> entityParameterCounts = config.useParameterFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Integer, Integer> parameterCounts = config.useParameterFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> semanticSignatureCounts = config.useSemanticFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> semanticSignatureBucketCounts = config.useSemanticFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> lastSemanticSignatureBucket = config.useSemanticFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> componentLevelTotals = config.useSemanticFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Integer, Integer> phraseCounts = config.useSemanticFeatures() ? new HashMap<>() : Collections.emptyMap();
+            Map<Long, Integer> transitionCounts = new HashMap<>();
+            Map<Integer, Integer> prevTotals = new HashMap<>();
+            int total = 0;
+            int maxEntityId = -1;
+            int maxComponentId = -1;
+            for (int i = 0; i < dataset.labels.size; i++) {
+                int bucketIndex = dataset.bucketIndexes.values[i];
+                if (bucketIndex < startBucket || bucketIndex >= endBucket) {
+                    continue;
+                }
+                int eventId = dataset.eventIds.values[i];
+                int entityId = dataset.entityIds.values[i];
+                int componentId = dataset.componentIds.values[i];
+                int levelId = dataset.levelIds.values[i];
+                int prevEventId = dataset.prevEventIds.values[i];
+                maxEntityId = max(maxEntityId, entityId);
+                maxComponentId = max(maxComponentId, componentId);
+                globalCounts.put(eventId, globalCounts.getOrDefault(eventId, 0) + 1);
+                entityEventCounts.put(entityEventKey(entityId, eventId),
+                        entityEventCounts.getOrDefault(entityEventKey(entityId, eventId), 0) + 1);
+                entityTotals.put(entityId, entityTotals.getOrDefault(entityId, 0) + 1);
+                componentEventCounts.put(entityEventKey(componentId, eventId),
+                        componentEventCounts.getOrDefault(entityEventKey(componentId, eventId), 0) + 1);
+                componentTotals.put(componentId, componentTotals.getOrDefault(componentId, 0) + 1);
+                if (config.useParameterFeatures()) {
+                    int parameterHash = dataset.parameterHashes.values[i];
+                    if (parameterHash != 0) {
+                        templateParameterCounts.put(entityEventKey(eventId, parameterHash),
+                                templateParameterCounts.getOrDefault(entityEventKey(eventId, parameterHash), 0) + 1);
+                        entityParameterCounts.put(entityEventKey(entityId, parameterHash),
+                                entityParameterCounts.getOrDefault(entityEventKey(entityId, parameterHash), 0) + 1);
+                        parameterCounts.put(parameterHash, parameterCounts.getOrDefault(parameterHash, 0) + 1);
+                    }
+                }
+                if (config.useSemanticFeatures()) {
+                    int phraseHash = dataset.phraseHashes.values[i];
+                    if (phraseHash != 0) {
+                        long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+                        long componentLevelKey = componentLevelKey(componentId, levelId);
+                        semanticSignatureCounts.put(signatureKey,
+                                semanticSignatureCounts.getOrDefault(signatureKey, 0) + 1);
+                        componentLevelTotals.put(componentLevelKey,
+                                componentLevelTotals.getOrDefault(componentLevelKey, 0) + 1);
+                        phraseCounts.put(phraseHash, phraseCounts.getOrDefault(phraseHash, 0) + 1);
+                        Integer previousBucket = lastSemanticSignatureBucket.put(signatureKey, bucketIndex);
+                        if (previousBucket == null || previousBucket != bucketIndex) {
+                            semanticSignatureBucketCounts.put(signatureKey,
+                                    semanticSignatureBucketCounts.getOrDefault(signatureKey, 0) + 1);
+                        }
+                    }
+                }
+                transitionCounts.put(transitionKey(prevEventId, eventId),
+                        transitionCounts.getOrDefault(transitionKey(prevEventId, eventId), 0) + 1);
+                prevTotals.put(prevEventId, prevTotals.getOrDefault(prevEventId, 0) + 1);
+                ++total;
+            }
+            Set<Integer> rare = new HashSet<>();
+            for (Map.Entry<Integer, Integer> entry : globalCounts.entrySet()) {
+                if (entry.getValue() <= config.rareEventMaxTrainCount) {
+                    rare.add(entry.getKey());
+                }
+            }
+            List<Map.Entry<Integer, Integer>> sorted = new ArrayList<>(globalCounts.entrySet());
+            sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+            Map<Integer, Integer> topIndex = new HashMap<>();
+            for (int i = 0; i < min(config.topK, sorted.size()); i++) {
+                topIndex.put(sorted.get(i).getKey(), i);
+            }
+            return new TrainStats(globalCounts, entityEventCounts, entityTotals, componentEventCounts, componentTotals,
+                    templateParameterCounts, entityParameterCounts, parameterCounts, semanticSignatureCounts,
+                    semanticSignatureBucketCounts, componentLevelTotals, phraseCounts, transitionCounts, prevTotals,
+                    rare, topIndex, total, max(1, globalCounts.size()), max(1, maxEntityId + 1),
+                    max(1, maxComponentId + 1), max(1, parameterCounts.size()),
+                    max(1, semanticSignatureCounts.size()), max(1, phraseCounts.size()));
+        }
+
+        private int entityEventCount(int entityId, int eventId) {
+            return entityEventCounts.getOrDefault(entityEventKey(entityId, eventId), 0);
+        }
+
+        private double entityRarity(int entityId, int eventId) {
+            int entityTotal = entityTotals.getOrDefault(entityId, 0);
+            if (entityTotal < 10) {
+                return globalRarity(eventId);
+            }
+            int count = entityEventCount(entityId, eventId);
+            double probability = (count + 1.0) / (entityTotal + vocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double componentRarity(int componentId, int eventId) {
+            int componentTotal = componentTotals.getOrDefault(componentId, 0);
+            if (componentTotal < 10) {
+                return globalRarity(eventId);
+            }
+            int count = componentEventCounts.getOrDefault(entityEventKey(componentId, eventId), 0);
+            double probability = (count + 1.0) / (componentTotal + vocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double entityGivenTemplateRarity(int entityId, int eventId) {
+            int eventTotal = globalCounts.getOrDefault(eventId, 0);
+            if (eventTotal < 10) {
+                return 0.0;
+            }
+            int count = entityEventCount(entityId, eventId);
+            double probability = (count + 1.0) / (eventTotal + entityCount + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double parameterRarity(int entityId, int eventId, int parameterHash) {
+            if (parameterHash == 0 || parameterVocabularySize <= 1) {
+                return 0.0;
+            }
+            double score = 0.0;
+            int templateTotal = globalCounts.getOrDefault(eventId, 0);
+            if (templateTotal >= 20) {
+                int count = templateParameterCounts.getOrDefault(entityEventKey(eventId, parameterHash), 0);
+                double probability = (count + 1.0) / (templateTotal + min(parameterVocabularySize, 10000) + 1.0);
+                score += min(8.0, -Math.log(probability));
+                if (count == 0) {
+                    score += 2.0;
+                }
+            }
+            int entityTotal = entityTotals.getOrDefault(entityId, 0);
+            if (entityTotal >= 20) {
+                int count = entityParameterCounts.getOrDefault(entityEventKey(entityId, parameterHash), 0);
+                double probability = (count + 1.0) / (entityTotal + min(parameterVocabularySize, 10000) + 1.0);
+                score += 0.35 * min(8.0, -Math.log(probability));
+            }
+            return min(12.0, score);
+        }
+
+        private int semanticSignatureCount(int componentId, int levelId, int phraseHash) {
+            return semanticSignatureCounts.getOrDefault(semanticSignatureKey(componentId, levelId, phraseHash), 0);
+        }
+
+        private int semanticSignatureBucketCount(int componentId, int levelId, int phraseHash) {
+            return semanticSignatureBucketCounts.getOrDefault(semanticSignatureKey(componentId, levelId, phraseHash), 0);
+        }
+
+        private double semanticSignatureRarity(int componentId, int levelId, int phraseHash) {
+            if (phraseHash == 0 || semanticSignatureVocabularySize <= 1) {
+                return 0.0;
+            }
+            long componentLevelKey = componentLevelKey(componentId, levelId);
+            int total = componentLevelTotals.getOrDefault(componentLevelKey, 0);
+            if (total < 20) {
+                return phraseRarity(phraseHash);
+            }
+            int count = semanticSignatureCount(componentId, levelId, phraseHash);
+            double probability = (count + 1.0) / (total + semanticSignatureVocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double phraseRarity(int phraseHash) {
+            if (phraseHash == 0 || phraseVocabularySize <= 1) {
+                return 0.0;
+            }
+            int count = phraseCounts.getOrDefault(phraseHash, 0);
+            double probability = (count + 1.0) / (globalTotal + phraseVocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double stableSignatureSuppression(int componentId, int levelId, int phraseHash, int minCount,
+                int minBuckets, double maxSuppression) {
+            int count = semanticSignatureCount(componentId, levelId, phraseHash);
+            int buckets = semanticSignatureBucketCount(componentId, levelId, phraseHash);
+            if (count < minCount || buckets < minBuckets) {
+                return 0.0;
+            }
+            return min(maxSuppression, Math.log1p(count) + 0.5 * Math.log1p(buckets));
+        }
+
+        private double globalRarity(int eventId) {
+            int count = globalCounts.getOrDefault(eventId, 0);
+            double probability = (count + 1.0) / (globalTotal + vocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double globalRate(int eventId) {
+            return globalTotal == 0 ? 0.0 : globalCounts.getOrDefault(eventId, 0) / (double) globalTotal;
+        }
+
+        private double transitionSurprise(int prevEventId, int eventId) {
+            int prevTotal = prevTotals.getOrDefault(prevEventId, 0);
+            if (prevTotal < 10) {
+                return globalRarity(eventId);
+            }
+            int count = transitionCounts.getOrDefault(transitionKey(prevEventId, eventId), 0);
+            double probability = (count + 1.0) / (prevTotal + vocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+    }
+
+    private static final class OnlineSemanticStats {
+        private final Map<Long, Integer> semanticSignatureCounts;
+        private final Map<Long, Integer> semanticSignatureBucketCounts;
+        private final Map<Long, Integer> componentLevelTotals;
+        private final Map<Integer, Integer> phraseCounts;
+        private final Map<Long, Integer> lastSemanticSignatureBucket = new HashMap<>();
+        private int total;
+        private int semanticSignatureVocabularySize;
+        private int phraseVocabularySize;
+
+        private OnlineSemanticStats(TrainStats stats) {
+            semanticSignatureCounts = new HashMap<>(stats.semanticSignatureCounts);
+            semanticSignatureBucketCounts = new HashMap<>(stats.semanticSignatureBucketCounts);
+            componentLevelTotals = new HashMap<>(stats.componentLevelTotals);
+            phraseCounts = new HashMap<>(stats.phraseCounts);
+            total = stats.globalTotal;
+            semanticSignatureVocabularySize = stats.semanticSignatureVocabularySize;
+            phraseVocabularySize = stats.phraseVocabularySize;
+        }
+
+        private double semanticSignatureRarity(int componentId, int levelId, int phraseHash) {
+            if (phraseHash == 0 || semanticSignatureVocabularySize <= 1) {
+                return 0.0;
+            }
+            long componentLevelKey = componentLevelKey(componentId, levelId);
+            int componentLevelTotal = componentLevelTotals.getOrDefault(componentLevelKey, 0);
+            if (componentLevelTotal < 20) {
+                return phraseRarity(phraseHash);
+            }
+            long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+            int count = semanticSignatureCounts.getOrDefault(signatureKey, 0);
+            double probability = (count + 1.0) / (componentLevelTotal + semanticSignatureVocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double phraseRarity(int phraseHash) {
+            if (phraseHash == 0 || phraseVocabularySize <= 1) {
+                return 0.0;
+            }
+            int count = phraseCounts.getOrDefault(phraseHash, 0);
+            double probability = (count + 1.0) / (total + phraseVocabularySize + 1.0);
+            return -Math.log(probability);
+        }
+
+        private double stableSignatureSuppression(int componentId, int levelId, int phraseHash) {
+            long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+            int count = semanticSignatureCounts.getOrDefault(signatureKey, 0);
+            int buckets = semanticSignatureBucketCounts.getOrDefault(signatureKey, 0);
+            if (count < 20 || buckets < 5) {
+                return 0.0;
+            }
+            return min(8.0, Math.log1p(count) + 0.5 * Math.log1p(buckets));
+        }
+
+        private void update(Dataset dataset, int lineIndex) {
+            int phraseHash = dataset.phraseHashes.values[lineIndex];
+            if (phraseHash == 0) {
+                return;
+            }
+            int componentId = dataset.componentIds.values[lineIndex];
+            int levelId = dataset.levelIds.values[lineIndex];
+            int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+            long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+            long componentLevelKey = componentLevelKey(componentId, levelId);
+            if (!semanticSignatureCounts.containsKey(signatureKey)) {
+                ++semanticSignatureVocabularySize;
+            }
+            if (!phraseCounts.containsKey(phraseHash)) {
+                ++phraseVocabularySize;
+            }
+            semanticSignatureCounts.put(signatureKey, semanticSignatureCounts.getOrDefault(signatureKey, 0) + 1);
+            componentLevelTotals.put(componentLevelKey, componentLevelTotals.getOrDefault(componentLevelKey, 0) + 1);
+            phraseCounts.put(phraseHash, phraseCounts.getOrDefault(phraseHash, 0) + 1);
+            Integer previousBucket = lastSemanticSignatureBucket.put(signatureKey, bucketIndex);
+            if (previousBucket == null || previousBucket != bucketIndex) {
+                semanticSignatureBucketCounts.put(signatureKey,
+                        semanticSignatureBucketCounts.getOrDefault(signatureKey, 0) + 1);
+            }
+            ++total;
+        }
+    }
+
+    private static long entityEventKey(int entityId, int eventId) {
+        return ((long) entityId << 32) ^ (eventId & 0xffffffffL);
+    }
+
+    private static long componentLevelKey(int componentId, int levelId) {
+        return ((long) componentId << 32) ^ (levelId & 0xffffffffL);
+    }
+
+    private static long semanticSignatureKey(int componentId, int levelId, int phraseHash) {
+        long key = 1469598103934665603L;
+        key = (key ^ componentId) * 1099511628211L;
+        key = (key ^ levelId) * 1099511628211L;
+        key = (key ^ phraseHash) * 1099511628211L;
+        return key;
+    }
+
+    private static long transitionKey(int prevEventId, int eventId) {
+        return (((long) prevEventId + 1L) << 32) ^ (eventId & 0xffffffffL);
+    }
+
+    private static final class Bucket {
+        private final long bucketKey;
+        private final Map<Integer, Integer> eventCounts = new HashMap<>();
+        private Map<Integer, Integer> entityCounts;
+        private Map<Long, Integer> entityEventCounts;
+        private final Map<Integer, Byte> maxKeywordByEvent = new HashMap<>();
+        private int totalCount;
+        private int anomalousCount;
+
+        private Bucket(long bucketKey) {
+            this.bucketKey = bucketKey;
+        }
+
+        private void add(int eventId, int entityId, boolean anomalous, byte keywordScore,
+                boolean trackEntityBucketCounts) {
+            eventCounts.put(eventId, eventCounts.getOrDefault(eventId, 0) + 1);
+            if (trackEntityBucketCounts) {
+                if (entityCounts == null) {
+                    entityCounts = new HashMap<>();
+                    entityEventCounts = new HashMap<>();
+                }
+                entityCounts.put(entityId, entityCounts.getOrDefault(entityId, 0) + 1);
+                long key = entityEventKey(entityId, eventId);
+                entityEventCounts.put(key, entityEventCounts.getOrDefault(key, 0) + 1);
+            }
+            byte previous = maxKeywordByEvent.getOrDefault(eventId, (byte) 0);
+            if (keywordScore > previous) {
+                maxKeywordByEvent.put(eventId, keywordScore);
+            }
+            ++totalCount;
+            if (anomalous) {
+                ++anomalousCount;
+            }
+        }
+    }
+
+    private static ParsedLine parseBglLikeLine(String line) {
+        String[] parts = line.split("\\s+", 10);
+        if (parts.length < 9) {
+            return null;
+        }
+        long epochSeconds;
+        try {
+            epochSeconds = Long.parseLong(parts[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        boolean label = !parts[0].startsWith("-");
+        String entity = parts[3];
+        String component = normalizeComponent(parts[7]);
+        String level = normalizeComponent(parts[8]);
+        String message = parts[8] + (parts.length >= 10 ? " " + parts[9] : "");
+        return new ParsedLine(epochSeconds, entity, component, level, label, message, keywordScore(message));
+    }
+
+    private static final class ParsedLine {
+        private final long epochSeconds;
+        private final String entity;
+        private final String component;
+        private final String level;
+        private final boolean label;
+        private final String message;
+        private final byte keywordScore;
+
+        private ParsedLine(long epochSeconds, String entity, String component, String level, boolean label, String message,
+                byte keywordScore) {
+            this.epochSeconds = epochSeconds;
+            this.entity = entity;
+            this.component = component;
+            this.level = level;
+            this.label = label;
+            this.message = message;
+            this.keywordScore = keywordScore;
+        }
+    }
+
+    private static byte keywordScore(String message) {
+        String lower = message.toLowerCase(Locale.ROOT);
+        if (containsAny(lower, "fatal", "panic", "kernel panic", "oops", "segfault", "assertion", "corrupt")) {
+            return 8;
+        }
+        if (containsAny(lower, "critical", "crit", "emerg", "alert", "exception", "abort", "timeout", "timed out",
+                "denied", "invalid", "unavailable", "unreachable", " reset ")) {
+            return 4;
+        }
+        if (containsAny(lower, "corrected", "recovered", "recovery")) {
+            return 0;
+        }
+        if (containsAny(lower, "error", "failed", "failure", " fail ", "unable", "no such", "lost", "warning",
+                "warn")) {
+            return 1;
+        }
+        return 0;
+    }
+
+    private static boolean containsAny(String value, String... needles) {
+        for (String needle : needles) {
+            if (value.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String normalizeComponent(String component) {
+        String lower = component.toLowerCase(Locale.ROOT);
+        StringBuilder builder = new StringBuilder(lower.length());
+        boolean previousZero = false;
+        for (int i = 0; i < lower.length(); i++) {
+            char value = lower.charAt(i);
+            if (value >= '0' && value <= '9') {
+                if (!previousZero) {
+                    builder.append('0');
+                    previousZero = true;
+                }
+            } else if (Character.isLetter(value) || value == '/' || value == '.' || value == '_' || value == '-') {
+                builder.append(value);
+                previousZero = false;
+            }
+        }
+        return builder.length() == 0 ? "unknown" : builder.toString();
+    }
+
+    private static int parameterHash(String message) {
+        String[] tokens = message.split("\\s+");
+        int hash = 0x811c9dc5;
+        int kept = 0;
+        for (String raw : tokens) {
+            String token = cleanParameterToken(raw);
+            if (token.isEmpty() || !looksLikeParameterValue(token)) {
+                continue;
+            }
+            for (int i = 0; i < token.length(); i++) {
+                hash ^= token.charAt(i);
+                hash *= 0x01000193;
+            }
+            hash ^= 0x9e3779b9 + kept;
+            hash *= 0x01000193;
+            ++kept;
+            if (kept >= 4) {
+                break;
+            }
+        }
+        return kept == 0 ? 0 : hash;
+    }
+
+    private static int semanticPhraseHash(String message) {
+        String[] rawTokens = message.split("\\s+");
+        int hash = 0x811c9dc5;
+        int kept = 0;
+        for (String raw : rawTokens) {
+            if (raw.indexOf('/') >= 0 || raw.indexOf('.') >= 0 || containsDigit(raw)) {
+                continue;
+            }
+            String token = semanticWordToken(raw);
+            if (token.isEmpty() || isSemanticStopToken(token)) {
+                continue;
+            }
+            for (int i = 0; i < token.length(); i++) {
+                hash ^= token.charAt(i);
+                hash *= 0x01000193;
+            }
+            hash ^= 0x9e3779b9 + kept;
+            hash *= 0x01000193;
+            ++kept;
+            if (kept >= 10) {
+                break;
+            }
+        }
+        return kept == 0 ? 0 : hash;
+    }
+
+    private static String semanticWordToken(String raw) {
+        StringBuilder builder = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char value = Character.toLowerCase(raw.charAt(i));
+            if (value >= 'a' && value <= 'z') {
+                builder.append(value);
+            }
+        }
+        return builder.length() < 2 ? "" : builder.toString();
+    }
+
+    private static boolean containsDigit(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isDigit(value.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSemanticStopToken(String token) {
+        switch (token) {
+        case "fatal":
+        case "failure":
+        case "failed":
+        case "error":
+        case "warning":
+        case "warn":
+        case "info":
+        case "the":
+        case "and":
+        case "or":
+        case "to":
+        case "from":
+        case "on":
+        case "for":
+        case "of":
+        case "in":
+        case "with":
+        case "after":
+        case "before":
+        case "due":
+        case "mode":
+        case "node":
+        case "card":
+        case "link":
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    private static String cleanParameterToken(String raw) {
+        int start = 0;
+        int end = raw.length() - 1;
+        while (start <= end && !isParameterBoundaryCharacter(raw.charAt(start))) {
+            ++start;
+        }
+        while (end >= start && !isParameterBoundaryCharacter(raw.charAt(end))) {
+            --end;
+        }
+        return start > end ? "" : raw.substring(start, end + 1).toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean isParameterBoundaryCharacter(char value) {
+        return Character.isLetterOrDigit(value) || value == '.' || value == ':' || value == '/' || value == '-'
+                || value == '_' || value == '@';
+    }
+
+    private static boolean looksLikeParameterValue(String token) {
+        boolean hasDigit = false;
+        boolean hasLetter = false;
+        boolean hasStructural = false;
+        for (int i = 0; i < token.length(); i++) {
+            char value = token.charAt(i);
+            hasDigit |= Character.isDigit(value);
+            hasLetter |= Character.isLetter(value);
+            hasStructural |= value == '.' || value == ':' || value == '/' || value == '-' || value == '_'
+                    || value == '@';
+        }
+        if (!hasDigit) {
+            return false;
+        }
+        if (!hasLetter && !hasStructural) {
+            return false;
+        }
+        return token.length() >= 2;
+    }
+
+    private static String normalize(String message) {
+        String lower = message.toLowerCase(Locale.ROOT);
+        StringBuilder builder = new StringBuilder(lower.length());
+        boolean previousZero = false;
+        for (int i = 0; i < lower.length(); i++) {
+            char value = lower.charAt(i);
+            if (value >= '0' && value <= '9') {
+                if (!previousZero) {
+                    builder.append('0');
+                    previousZero = true;
+                }
+            } else {
+                builder.append(value);
+                previousZero = false;
+            }
+        }
+        return builder.toString();
+    }
+
+    private static int positiveHash(String value) {
+        int hash = 0x811c9dc5;
+        for (int i = 0; i < value.length(); i++) {
+            hash ^= value.charAt(i);
+            hash *= 0x01000193;
+        }
+        return hash & 0x7fffffff;
+    }
+
+    private static final class SimpleDrainParser {
+        private final double similarityThreshold;
+        private final Map<Integer, List<DrainCluster>> clustersByLength = new HashMap<>();
+        private int nextId;
+
+        private SimpleDrainParser(double similarityThreshold) {
+            this.similarityThreshold = similarityThreshold;
+        }
+
+        private int parse(String message) {
+            List<String> tokens = tokenize(message);
+            List<DrainCluster> candidates = clustersByLength.get(tokens.size());
+            DrainCluster best = null;
+            double bestSimilarity = -1.0;
+            if (candidates != null) {
+                for (DrainCluster candidate : candidates) {
+                    double similarity = similarity(tokens, candidate.template);
+                    if (similarity > bestSimilarity) {
+                        bestSimilarity = similarity;
+                        best = candidate;
+                    }
+                }
+            }
+            if (best != null && bestSimilarity >= similarityThreshold) {
+                updateTemplate(best.template, tokens);
+                return best.id;
+            }
+            DrainCluster cluster = new DrainCluster(nextId++, tokens);
+            clustersByLength.computeIfAbsent(tokens.size(), ignored -> new ArrayList<>()).add(cluster);
+            return cluster.id;
+        }
+
+        private int templateCount() {
+            return nextId;
+        }
+
+        private String[] templates() {
+            String[] result = new String[nextId];
+            for (List<DrainCluster> clusters : clustersByLength.values()) {
+                for (DrainCluster cluster : clusters) {
+                    result[cluster.id] = String.join(" ", cluster.template);
+                }
+            }
+            for (int i = 0; i < result.length; i++) {
+                if (result[i] == null) {
+                    result[i] = "<unknown>";
+                }
+            }
+            return result;
+        }
+
+        private static List<String> tokenize(String message) {
+            if (message == null || message.trim().isEmpty()) {
+                return Collections.singletonList("<empty>");
+            }
+            String[] rawTokens = message.trim().split("\\s+");
+            List<String> tokens = new ArrayList<>(rawTokens.length);
+            for (String rawToken : rawTokens) {
+                String token = normalizeToken(rawToken);
+                if (!token.isEmpty()) {
+                    tokens.add(token);
+                }
+            }
+            return tokens.isEmpty() ? Collections.singletonList("<empty>") : tokens;
+        }
+
+        private static String normalizeToken(String rawToken) {
+            for (int i = 0; i < rawToken.length(); i++) {
+                if (Character.isDigit(rawToken.charAt(i))) {
+                    return "<*>";
+                }
+            }
+            int start = 0;
+            int end = rawToken.length() - 1;
+            while (start <= end && !isTemplateCharacter(rawToken.charAt(start))) {
+                ++start;
+            }
+            while (end >= start && !isTemplateCharacter(rawToken.charAt(end))) {
+                --end;
+            }
+            return start > end ? "" : rawToken.substring(start, end + 1);
+        }
+
+        private static boolean isTemplateCharacter(char value) {
+            return value >= 'a' && value <= 'z' || value == '<' || value == '>' || value == '*';
+        }
+
+        private static double similarity(List<String> tokens, List<String> template) {
+            if (tokens.size() != template.size()) {
+                return 0.0;
+            }
+            int exact = 0;
+            int comparable = 0;
+            for (int i = 0; i < tokens.size(); i++) {
+                String templateToken = template.get(i);
+                if (!"<*>".equals(templateToken)) {
+                    ++comparable;
+                    if (templateToken.equals(tokens.get(i))) {
+                        ++exact;
+                    }
+                }
+            }
+            return comparable == 0 ? 1.0 : (double) exact / comparable;
+        }
+
+        private static void updateTemplate(List<String> template, List<String> tokens) {
+            for (int i = 0; i < template.size(); i++) {
+                if (!template.get(i).equals(tokens.get(i))) {
+                    template.set(i, "<*>");
+                }
+            }
+        }
+    }
+
+    private static final class DrainCluster {
+        private final int id;
+        private final List<String> template;
+
+        private DrainCluster(int id, List<String> template) {
+            this.id = id;
+            this.template = new ArrayList<>(template);
+        }
+    }
+
+    private static final class IntList {
+        private int[] values = new int[1024];
+        private int size;
+
+        private void add(int value) {
+            ensure(size + 1);
+            values[size++] = value;
+        }
+
+        private void ensure(int capacity) {
+            if (capacity > values.length) {
+                int next = values.length;
+                while (next < capacity) {
+                    next *= 2;
+                }
+                values = java.util.Arrays.copyOf(values, next);
+            }
+        }
+    }
+
+    private static final class ByteList {
+        private byte[] values = new byte[1024];
+        private int size;
+
+        private void add(byte value) {
+            ensure(size + 1);
+            values[size++] = value;
+        }
+
+        private int sum() {
+            int sum = 0;
+            for (int i = 0; i < size; i++) {
+                sum += values[i];
+            }
+            return sum;
+        }
+
+        private void ensure(int capacity) {
+            if (capacity > values.length) {
+                int next = values.length;
+                while (next < capacity) {
+                    next *= 2;
+                }
+                values = java.util.Arrays.copyOf(values, next);
+            }
+        }
+    }
+
+    private static final class TopK {
+        private final double[] scores;
+        private final boolean[] labels;
+        private int size;
+
+        private TopK(int maxK) {
+            this.scores = new double[maxK];
+            this.labels = new boolean[maxK];
+        }
+
+        private void add(double score, boolean label) {
+            if (size < scores.length) {
+                scores[size] = score;
+                labels[size] = label;
+                ++size;
+                return;
+            }
+            int worst = 0;
+            for (int i = 1; i < size; i++) {
+                if (scores[i] < scores[worst]) {
+                    worst = i;
+                }
+            }
+            if (score > scores[worst]) {
+                scores[worst] = score;
+                labels[worst] = label;
+            }
+        }
+
+        private void sortDescending() {
+            for (int i = 0; i < size; i++) {
+                for (int j = i + 1; j < size; j++) {
+                    if (scores[j] > scores[i]) {
+                        double score = scores[i];
+                        scores[i] = scores[j];
+                        scores[j] = score;
+                        boolean label = labels[i];
+                        labels[i] = labels[j];
+                        labels[j] = label;
+                    }
+                }
+            }
+        }
+    }
+
+    private static final class ScoreBucket {
+        private final int startLine;
+        private final double[] scores;
+        private final int[] classes;
+
+        private ScoreBucket(int startLine, double[] scores, int[] classes) {
+            this.startLine = startLine;
+            this.scores = scores;
+            this.classes = classes;
+        }
+
+        private ScoreBucket truncate(int size) {
+            if (size == scores.length) {
+                return this;
+            }
+            return new ScoreBucket(startLine, java.util.Arrays.copyOf(scores, size), java.util.Arrays.copyOf(classes, size));
+        }
+    }
+
+    private static final class ScoreBlock {
+        private final double[] scores;
+        private final int[] classes;
+        private final int[] lineIndexes;
+
+        private ScoreBlock(double[] scores, int[] classes, int[] lineIndexes) {
+            this.scores = scores;
+            this.classes = classes;
+            this.lineIndexes = lineIndexes;
+        }
+    }
+
+    private static final class TailCalibration {
+        private final double[][] sortedScoresByClass;
+        private final int totalCount;
+
+        private TailCalibration(double[][] sortedScoresByClass, int totalCount) {
+            this.sortedScoresByClass = sortedScoresByClass;
+            this.totalCount = totalCount;
+        }
+
+        private double[] scoresForClass(int scoreClass) {
+            if (scoreClass < sortedScoresByClass.length && sortedScoresByClass[scoreClass].length > 0) {
+                return sortedScoresByClass[scoreClass];
+            }
+            return sortedScoresByClass[0];
+        }
+    }
+
+    private static final class RollingLineCalibrator {
+        private final java.util.ArrayDeque<ScoreBucket> buckets = new java.util.ArrayDeque<>();
+        private final RollingHistogram[] histograms;
+        private final boolean conditional;
+
+        private RollingLineCalibrator(double maxScore, int bins, boolean conditional) {
+            this.conditional = conditional;
+            int count = conditional ? 4 : 1;
+            histograms = new RollingHistogram[count];
+            for (int i = 0; i < histograms.length; i++) {
+                histograms[i] = new RollingHistogram(maxScore, bins);
+            }
+        }
+
+        private void add(ScoreBucket bucket) {
+            buckets.addLast(bucket);
+            for (int i = 0; i < bucket.scores.length; i++) {
+                histograms[histogramIndex(bucket.classes[i])].add(bucket.scores[i]);
+            }
+        }
+
+        private void removeOldest() {
+            ScoreBucket bucket = buckets.removeFirst();
+            for (int i = 0; i < bucket.scores.length; i++) {
+                histograms[histogramIndex(bucket.classes[i])].remove(bucket.scores[i]);
+            }
+        }
+
+        private double pValue(double score, int scoreClass) {
+            RollingHistogram histogram = histograms[histogramIndex(scoreClass)];
+            if (histogram.total == 0 && conditional) {
+                histogram = histograms[0];
+            }
+            return histogram.upperTailPValue(score);
+        }
+
+        private int histogramIndex(int scoreClass) {
+            return conditional ? min(max(scoreClass, 0), histograms.length - 1) : 0;
+        }
+
+        private int size() {
+            return buckets.size();
+        }
+
+        private int totalCount() {
+            int total = 0;
+            for (RollingHistogram histogram : histograms) {
+                total += histogram.total;
+            }
+            return total;
+        }
+    }
+
+    private static final class RollingHistogram {
+        private final double maxScore;
+        private final int[] counts;
+        private int total;
+
+        private RollingHistogram(double maxScore, int bins) {
+            this.maxScore = maxScore;
+            this.counts = new int[bins];
+        }
+
+        private void add(double score) {
+            ++counts[bin(score)];
+            ++total;
+        }
+
+        private void remove(double score) {
+            int bin = bin(score);
+            if (counts[bin] > 0) {
+                --counts[bin];
+                --total;
+            }
+        }
+
+        private double upperTailPValue(double score) {
+            if (total == 0) {
+                return 1.0;
+            }
+            int start = bin(score);
+            int tail = 0;
+            for (int i = start; i < counts.length; i++) {
+                tail += counts[i];
+            }
+            return (tail + 1.0) / (total + 1.0);
+        }
+
+        private int bin(double score) {
+            double clean = Double.isFinite(score) ? max(0.0, min(maxScore, score)) : maxScore;
+            int bin = (int) Math.floor(clean / maxScore * (counts.length - 1));
+            return min(max(bin, 0), counts.length - 1);
+        }
+    }
+
+    private static final class RollingTemplateBaseline {
+        private final java.util.ArrayDeque<Integer> bucketIndexes = new java.util.ArrayDeque<>();
+        private final int[] counts;
+        private int total;
+
+        private RollingTemplateBaseline(int templateCount) {
+            counts = new int[max(1, templateCount)];
+        }
+
+        private void add(int bucketIndex, Bucket bucket) {
+            bucketIndexes.addLast(bucketIndex);
+            total += bucket.totalCount;
+            for (Map.Entry<Integer, Integer> entry : bucket.eventCounts.entrySet()) {
+                counts[entry.getKey()] += entry.getValue();
+            }
+        }
+
+        private void removeOldest(Dataset dataset) {
+            Bucket bucket = dataset.buckets.get(bucketIndexes.removeFirst());
+            total -= bucket.totalCount;
+            for (Map.Entry<Integer, Integer> entry : bucket.eventCounts.entrySet()) {
+                counts[entry.getKey()] -= entry.getValue();
+            }
+        }
+
+        private int size() {
+            return bucketIndexes.size();
+        }
+
+        private double poissonUpperTail(int bucketTotal, int eventId, int observed) {
+            if (observed <= 0 || total <= 0) {
+                return 1.0;
+            }
+            double probability = (counts[eventId] + 1.0) / (total + counts.length);
+            double lambda = max(1.0e-12, bucketTotal * probability);
+            return poissonSurvival(lambda, observed);
+        }
+    }
+
+    private static double poissonSurvival(double lambda, int observed) {
+        if (observed <= 0) {
+            return 1.0;
+        }
+        if (lambda > 100.0) {
+            double z = (observed - 0.5 - lambda) / Math.sqrt(lambda);
+            return normalUpperTail(z);
+        }
+        double term = Math.exp(-lambda);
+        double cumulative = term;
+        for (int k = 1; k < observed; k++) {
+            term *= lambda / k;
+            cumulative += term;
+            if (term < 1.0e-15) {
+                break;
+            }
+        }
+        return max(0.0, min(1.0, 1.0 - cumulative));
+    }
+
+    private static double normalUpperTail(double z) {
+        return 0.5 * erfcApprox(z / Math.sqrt(2.0));
+    }
+
+    private static double erfcApprox(double x) {
+        double z = Math.abs(x);
+        double t = 1.0 / (1.0 + 0.5 * z);
+        double ans = t * Math.exp(-z * z - 1.26551223
+                + t * (1.00002368
+                + t * (0.37409196
+                + t * (0.09678418
+                + t * (-0.18628806
+                + t * (0.27886807
+                + t * (-1.13520398
+                + t * (1.48851587
+                + t * (-0.82215223
+                + t * 0.17087277)))))))));
+        return x >= 0 ? ans : 2.0 - ans;
+    }
+
+    private static final class ThresholdChoice {
+        private final double threshold;
+        private final double validationPrecision;
+        private final double validationRecall;
+        private final double validationF1;
+
+        private ThresholdChoice(double threshold, double validationPrecision, double validationRecall,
+                double validationF1) {
+            this.threshold = threshold;
+            this.validationPrecision = validationPrecision;
+            this.validationRecall = validationRecall;
+            this.validationF1 = validationF1;
+        }
+    }
+
+    private static final class Metrics {
+        private long tp;
+        private long fp;
+        private long fn;
+        private long tn;
+
+        private Metrics(long tp, long fp, long fn, long tn) {
+            this.tp = tp;
+            this.fp = fp;
+            this.fn = fn;
+            this.tn = tn;
+        }
+
+        private Metrics add(boolean label, boolean prediction) {
+            if (label && prediction) {
+                ++tp;
+            } else if (prediction) {
+                ++fp;
+            } else if (label) {
+                ++fn;
+            } else {
+                ++tn;
+            }
+            return this;
+        }
+
+        private double precision() {
+            return tp + fp == 0 ? 0.0 : tp / (double) (tp + fp);
+        }
+
+        private double recall() {
+            return tp + fn == 0 ? 0.0 : tp / (double) (tp + fn);
+        }
+
+        private double f1() {
+            double p = precision();
+            double r = recall();
+            return p + r == 0 ? 0.0 : 2.0 * p * r / (p + r);
+        }
+    }
+
+    private static final class DiagnosticThreshold {
+        private final double threshold;
+        private final double precision;
+        private final double recall;
+        private final double f1;
+
+        private DiagnosticThreshold(double threshold, double precision, double recall, double f1) {
+            this.threshold = threshold;
+            this.precision = precision;
+            this.recall = recall;
+            this.f1 = f1;
+        }
+    }
+
+    private static final class TemplateAggregate {
+        private final int eventId;
+        private final Map<Integer, Integer> componentCounts = new HashMap<>();
+        private final Map<Integer, Integer> levelCounts = new HashMap<>();
+        private final List<String> fpSamples = new ArrayList<>();
+        private final List<String> fnSamples = new ArrayList<>();
+        private final List<String> tpSamples = new ArrayList<>();
+        private long tp;
+        private long fp;
+        private long fn;
+        private long tn;
+        private double sumScore;
+        private double maxScore;
+
+        private TemplateAggregate(int eventId) {
+            this.eventId = eventId;
+        }
+
+        private void add(Dataset dataset, int lineIndex, double score, boolean label, boolean prediction,
+                int sampleLimit) {
+            sumScore += score;
+            maxScore = max(maxScore, score);
+            int componentId = dataset.componentIds.values[lineIndex];
+            int levelId = dataset.levelIds.values[lineIndex];
+            componentCounts.put(componentId, componentCounts.getOrDefault(componentId, 0) + 1);
+            levelCounts.put(levelId, levelCounts.getOrDefault(levelId, 0) + 1);
+            if (label && prediction) {
+                ++tp;
+                addSample(dataset, lineIndex, tpSamples, sampleLimit);
+            } else if (prediction) {
+                ++fp;
+                addSample(dataset, lineIndex, fpSamples, sampleLimit);
+            } else if (label) {
+                ++fn;
+                addSample(dataset, lineIndex, fnSamples, sampleLimit);
+            } else {
+                ++tn;
+            }
+        }
+
+        private void addSample(Dataset dataset, int lineIndex, List<String> samples, int sampleLimit) {
+            if (samples.size() >= sampleLimit) {
+                return;
+            }
+            if (dataset.lineMessages.size() == dataset.labels.size) {
+                samples.add(dataset.lineMessages.get(lineIndex));
+            }
+        }
+
+        private long total() {
+            return tp + fp + fn + tn;
+        }
+
+        private long countFor(String group) {
+            switch (group) {
+            case "fp":
+                return fp;
+            case "fn":
+                return fn;
+            case "tp":
+                return tp;
+            default:
+                return 0;
+            }
+        }
+
+        private TemplateDiagnostic toDiagnostic(String datasetName, Dataset dataset, TrainStats stats, String scoreMode,
+                String group, DiagnosticThreshold threshold) {
+            String component = nameForId(dataset.componentNames, dominantId(componentCounts));
+            String level = nameForId(dataset.levelNames, dominantId(levelCounts));
+            List<String> samples = "fp".equals(group) ? fpSamples : "fn".equals(group) ? fnSamples : tpSamples;
+            return new TemplateDiagnostic(datasetName, scoreMode, group, threshold, eventId, total(), tp, fp, fn, tn,
+                    sumScore / max(1.0, total()), maxScore, stats.globalRarity(eventId),
+                    dataset.templateTexts.length > eventId ? dataset.templateTexts[eventId] : "<unknown>", component,
+                    level, samples);
+        }
+
+        private int dominantId(Map<Integer, Integer> counts) {
+            int bestId = -1;
+            int bestCount = -1;
+            for (Map.Entry<Integer, Integer> entry : counts.entrySet()) {
+                if (entry.getValue() > bestCount) {
+                    bestId = entry.getKey();
+                    bestCount = entry.getValue();
+                }
+            }
+            return bestId;
+        }
+    }
+
+    private static final class TemplateDiagnostic {
+        private final String dataset;
+        private final String scoreMode;
+        private final String group;
+        private final DiagnosticThreshold threshold;
+        private final int templateId;
+        private final long total;
+        private final long tp;
+        private final long fp;
+        private final long fn;
+        private final long tn;
+        private final double avgScore;
+        private final double maxScore;
+        private final double globalRarity;
+        private final String template;
+        private final String dominantComponent;
+        private final String dominantLevel;
+        private final List<String> samples;
+
+        private TemplateDiagnostic(String dataset, String scoreMode, String group, DiagnosticThreshold threshold,
+                int templateId, long total, long tp, long fp, long fn, long tn, double avgScore, double maxScore,
+                double globalRarity, String template, String dominantComponent, String dominantLevel,
+                List<String> samples) {
+            this.dataset = dataset;
+            this.scoreMode = scoreMode;
+            this.group = group;
+            this.threshold = threshold;
+            this.templateId = templateId;
+            this.total = total;
+            this.tp = tp;
+            this.fp = fp;
+            this.fn = fn;
+            this.tn = tn;
+            this.avgScore = avgScore;
+            this.maxScore = maxScore;
+            this.globalRarity = globalRarity;
+            this.template = template;
+            this.dominantComponent = dominantComponent;
+            this.dominantLevel = dominantLevel;
+            this.samples = samples;
+        }
+
+        private static String header() {
+            return "dataset,score_mode,group,threshold,threshold_precision,threshold_recall,threshold_f1,template_id,total,tp,fp,fn,tn,template_precision,template_recall,avg_score,max_score,global_rarity,dominant_component,dominant_level,template,sample_1,sample_2,sample_3";
+        }
+
+        private String toCsv() {
+            double templatePrecision = tp + fp == 0 ? 0.0 : tp / (double) (tp + fp);
+            double templateRecall = tp + fn == 0 ? 0.0 : tp / (double) (tp + fn);
+            return String.format(Locale.ROOT,
+                    "%s,%s,%s,%.8f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%s,%s,%s,%s,%s,%s",
+                    csv(dataset), csv(scoreMode), csv(group), threshold.threshold, threshold.precision,
+                    threshold.recall, threshold.f1, templateId, total, tp, fp, fn, tn, templatePrecision,
+                    templateRecall, avgScore, maxScore, globalRarity, csv(dominantComponent), csv(dominantLevel),
+                    csv(template), csv(sample(0)), csv(sample(1)), csv(sample(2)));
+        }
+
+        private String sample(int index) {
+            return index < samples.size() ? samples.get(index) : "";
+        }
+    }
+
+    private static String nameForId(List<String> names, int id) {
+        return id >= 0 && id < names.size() ? names.get(id) : "";
+    }
+
+    private static String csv(String value) {
+        if (value == null) {
+            return "";
+        }
+        boolean quote = value.indexOf(',') >= 0 || value.indexOf('"') >= 0 || value.indexOf('\n') >= 0
+                || value.indexOf('\r') >= 0;
+        if (!quote) {
+            return value;
+        }
+        return '"' + value.replace("\"", "\"\"") + '"';
+    }
+
+    private static final class TopKMetrics {
+        private final int[] predicted;
+        private final int[] truePositive;
+        private final long totalAnomalies;
+
+        private TopKMetrics(int[] predicted, int[] truePositive, long totalAnomalies) {
+            this.predicted = predicted;
+            this.truePositive = truePositive;
+            this.totalAnomalies = totalAnomalies;
+        }
+
+        private double precisionAt(int k) {
+            return predicted[k - 1] == 0 ? 0.0 : truePositive[k - 1] / (double) predicted[k - 1];
+        }
+
+        private double recallAt(int k) {
+            return totalAnomalies == 0 ? 0.0 : truePositive[k - 1] / (double) totalAnomalies;
+        }
+    }
+
+    private static final class Split {
+        private final int trainEnd;
+        private final int calibrationEnd;
+
+        private Split(int trainEnd, int calibrationEnd) {
+            this.trainEnd = trainEnd;
+            this.calibrationEnd = calibrationEnd;
+        }
+
+        private static Split from(Dataset dataset, Config config) {
+            int trainEnd = max(1, (int) Math.floor(config.trainFraction * dataset.buckets.size()));
+            int calibrationEnd = min(dataset.buckets.size() - 1,
+                    trainEnd + max(1, (int) Math.floor(config.validationFraction
+                            * max(1, dataset.buckets.size() - trainEnd))));
+            if (calibrationEnd <= trainEnd) {
+                calibrationEnd = min(dataset.buckets.size(), trainEnd + 1);
+            }
+            return new Split(trainEnd, calibrationEnd);
+        }
+    }
+
+    private static final class FdrResult {
+        private final String dataset;
+        private final String method;
+        private final String context;
+        private final double contextAnomalyRate;
+        private final int contextShingle;
+        private final double q;
+        private final int calibrationHypotheses;
+        private final double contextLineRecall;
+        private final Metrics metrics;
+
+        private FdrResult(String dataset, String method, String context, double contextAnomalyRate, int contextShingle,
+                double q, int calibrationHypotheses, double contextLineRecall, Metrics metrics) {
+            this.dataset = dataset;
+            this.method = method;
+            this.context = context;
+            this.contextAnomalyRate = contextAnomalyRate;
+            this.contextShingle = contextShingle;
+            this.q = q;
+            this.calibrationHypotheses = calibrationHypotheses;
+            this.contextLineRecall = contextLineRecall;
+            this.metrics = metrics;
+        }
+
+        private static String header() {
+            return "dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1";
+        }
+
+        private String toCsv() {
+            return String.format(Locale.ROOT,
+                    "%s,%s,%s,%.6f,%d,%.6f,%d,%.6f,%d,%d,%d,%d,%.6f,%.6f,%.6f", dataset, method,
+                    context, contextAnomalyRate, contextShingle, q, calibrationHypotheses, contextLineRecall,
+                    metrics.tp, metrics.fp, metrics.fn, metrics.tn, metrics.precision(), metrics.recall(),
+                    metrics.f1());
+        }
+    }
+
+    private static final class OracleResult {
+        private final String dataset;
+        private final String score;
+        private final String context;
+        private final double contextAnomalyRate;
+        private final int contextShingle;
+        private final int evaluatedLines;
+        private final long positives;
+        private final double bestPrecisionAtRecall50;
+        private final double bestRecallAtPrecision50;
+        private final double bestF1;
+        private final double bestF1Precision;
+        private final double bestF1Recall;
+        private final double averagePrecision;
+        private final boolean targetFeasible;
+
+        private OracleResult(String dataset, String score, String context, double contextAnomalyRate, int contextShingle,
+                int evaluatedLines, long positives, double bestPrecisionAtRecall50, double bestRecallAtPrecision50,
+                double bestF1, double bestF1Precision, double bestF1Recall, double averagePrecision,
+                boolean targetFeasible) {
+            this.dataset = dataset;
+            this.score = score;
+            this.context = context;
+            this.contextAnomalyRate = contextAnomalyRate;
+            this.contextShingle = contextShingle;
+            this.evaluatedLines = evaluatedLines;
+            this.positives = positives;
+            this.bestPrecisionAtRecall50 = bestPrecisionAtRecall50;
+            this.bestRecallAtPrecision50 = bestRecallAtPrecision50;
+            this.bestF1 = bestF1;
+            this.bestF1Precision = bestF1Precision;
+            this.bestF1Recall = bestF1Recall;
+            this.averagePrecision = averagePrecision;
+            this.targetFeasible = targetFeasible;
+        }
+
+        private static String header() {
+            return "dataset,score,context,context_anomaly_rate,context_shingle,evaluated_lines,positives,best_precision_at_recall_0_5,best_recall_at_precision_0_5,best_f1,best_f1_precision,best_f1_recall,average_precision,target_feasible";
+        }
+
+        private String toCsv() {
+            return String.format(Locale.ROOT,
+                    "%s,%s,%s,%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s", dataset, score,
+                    context, contextAnomalyRate, contextShingle, evaluatedLines, positives,
+                    bestPrecisionAtRecall50, bestRecallAtPrecision50, bestF1, bestF1Precision, bestF1Recall,
+                averagePrecision, targetFeasible);
+    }
+
+    private static OracleResult oracleDiagnosticOnlineSemantic(String datasetName, String scoreMode, Dataset dataset,
+            TrainStats stats, ContextSet context, int startBucket, int endBucket) {
+        int count = dataset.countLines(startBucket, endBucket, context);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        OnlineSemanticStats onlineStats = new OnlineSemanticStats(stats);
+        boolean includePhrase = !scoreMode.endsWith("_no_phrase");
+        boolean includeStableSuppression = !scoreMode.endsWith("_no_suppress");
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            if (!context.candidates[bucketIndex]) {
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    onlineStats.update(dataset, i);
+                }
+                continue;
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                boolean label = dataset.labels.values[i] != 0;
+                double score = bglSemanticScore(dataset, stats, context, i, includePhrase, includeStableSuppression,
+                        true, onlineStats);
+                packed[index++] = pack(score, label);
+                if (label) {
+                    ++positives;
+                }
+                onlineStats.update(dataset, i);
+            }
+        }
+        if (index == 0 || positives == 0) {
+            return new OracleResult(datasetName, "score_mode_" + scoreMode, context.name, context.anomalyRate,
+                    context.shingleSize, index, positives, 0, 0, 0, 0, 0, 0, false);
+        }
+        java.util.Arrays.sort(packed, 0, index);
+        long tp = 0;
+        double bestF1 = 0;
+        double bestF1Precision = 0;
+        double bestF1Recall = 0;
+        double bestPrecisionAtRecall50 = 0;
+        double bestRecallAtPrecision50 = 0;
+        double averagePrecisionNumerator = 0;
+        boolean targetFeasible = false;
+        for (int i = 0; i < index; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+                averagePrecisionNumerator += tp / (double) (i + 1L);
+            }
+            double precision = tp / (double) (i + 1L);
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+            if (f1 > bestF1) {
+                bestF1 = f1;
+                bestF1Precision = precision;
+                bestF1Recall = recall;
+            }
+            if (recall >= 0.5) {
+                bestPrecisionAtRecall50 = max(bestPrecisionAtRecall50, precision);
+            }
+            if (precision >= 0.5) {
+                bestRecallAtPrecision50 = max(bestRecallAtPrecision50, recall);
+            }
+            if (precision >= 0.5 && recall >= 0.5) {
+                targetFeasible = true;
+            }
+        }
+        double averagePrecision = averagePrecisionNumerator / positives;
+        return new OracleResult(datasetName, "score_mode_" + scoreMode, context.name, context.anomalyRate,
+                context.shingleSize, index, positives, bestPrecisionAtRecall50, bestRecallAtPrecision50, bestF1,
+                bestF1Precision, bestF1Recall, averagePrecision, targetFeasible);
+    }
+    }
+
+    private static final class Result {
+        private final String dataset;
+        private final String scorer;
+        private final String context;
+        private final double contextAnomalyRate;
+        private final int contextShingle;
+        private final double threshold;
+        private final double validationPrecision;
+        private final double validationRecall;
+        private final double validationF1;
+        private final double candidateLineRecall;
+        private final Metrics metrics;
+        private final TopKMetrics topK;
+
+        private Result(String dataset, String scorer, String context, double contextAnomalyRate, int contextShingle,
+                double threshold, double validationPrecision, double validationRecall, double validationF1,
+                double candidateLineRecall, Metrics metrics, TopKMetrics topK) {
+            this.dataset = dataset;
+            this.scorer = scorer;
+            this.context = context;
+            this.contextAnomalyRate = contextAnomalyRate;
+            this.contextShingle = contextShingle;
+            this.threshold = threshold;
+            this.validationPrecision = validationPrecision;
+            this.validationRecall = validationRecall;
+            this.validationF1 = validationF1;
+            this.candidateLineRecall = candidateLineRecall;
+            this.metrics = metrics;
+            this.topK = topK;
+        }
+
+        private static String header() {
+            return "dataset,scorer,context,context_anomaly_rate,context_shingle,threshold,validation_precision,validation_recall,validation_f1,candidate_line_recall,tp,fp,fn,tn,precision,recall,f1,precision_at_1,recall_at_1,precision_at_3,recall_at_3,precision_at_5,recall_at_5";
+        }
+
+        private String toCsv() {
+            return String.format(Locale.ROOT,
+                    "%s,%s,%s,%.6f,%d,%.8f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                    dataset, scorer, context, contextAnomalyRate, contextShingle, threshold, validationPrecision,
+                    validationRecall, validationF1, candidateLineRecall, metrics.tp, metrics.fp, metrics.fn,
+                    metrics.tn, metrics.precision(), metrics.recall(), metrics.f1(), topK.precisionAt(1),
+                    topK.recallAt(1), topK.precisionAt(3), topK.recallAt(3), topK.precisionAt(5), topK.recallAt(5));
+        }
+    }
+
+    private static final class RarityCount {
+        private final double rarity;
+        private final int count;
+
+        private RarityCount(double rarity, int count) {
+            this.rarity = rarity;
+            this.count = count;
+        }
+    }
+
+    private static final class Config {
+        private final List<String> datasets;
+        private final String bglPath;
+        private final String thunderbirdPath;
+        private final String output;
+        private final int bucketSeconds;
+        private final int bglSampleModulo;
+        private final int thunderbirdSampleModulo;
+        private final double trainFraction;
+        private final double validationFraction;
+        private final int topK;
+        private final int rareEventMaxTrainCount;
+        private final double drainSimilarity;
+        private final int numberOfTrees;
+        private final int sampleSize;
+        private final int outputAfter;
+        private final double zFactor;
+        private final long seed;
+        private final int progressInterval;
+        private final int top;
+        private final boolean includeUngated;
+        private final List<Double> contextAnomalyRates;
+        private final String thresholdMode;
+        private final List<Double> fdrQValues;
+        private final String statsPeriod;
+        private final String scoreMode;
+        private final int rollingHorizonBuckets;
+        private final int rollingBins;
+        private final double rollingScoreMax;
+        private final boolean excludeAlertUpdates;
+        private final int expandBuckets;
+        private final int tailBlockBuckets;
+        private final int tailMinSelected;
+        private final double tailSignificance;
+        private final boolean parameterFeatures;
+        private final boolean entityBucketCounts;
+        private final double diagnosticRecallTarget;
+        private final int diagnosticTopTemplates;
+        private final int diagnosticSamples;
+        private final List<QuantilePair> seedExpandPairs;
+        private final double diagnosticQuantile;
+
+        private Config(List<String> datasets, String bglPath, String thunderbirdPath, String output, int bucketSeconds,
+                int bglSampleModulo, int thunderbirdSampleModulo, double trainFraction, double validationFraction,
+                int topK, int rareEventMaxTrainCount, double drainSimilarity, int numberOfTrees, int sampleSize,
+                int outputAfter, double zFactor, long seed, int progressInterval, int top, boolean includeUngated,
+                List<Double> contextAnomalyRates, String thresholdMode, List<Double> fdrQValues, String statsPeriod,
+                String scoreMode, int rollingHorizonBuckets, int rollingBins, double rollingScoreMax,
+                boolean excludeAlertUpdates, int expandBuckets, int tailBlockBuckets, int tailMinSelected,
+                double tailSignificance, boolean parameterFeatures, boolean entityBucketCounts,
+                double diagnosticRecallTarget, int diagnosticTopTemplates, int diagnosticSamples,
+                List<QuantilePair> seedExpandPairs, double diagnosticQuantile) {
+            this.datasets = datasets;
+            this.bglPath = bglPath;
+            this.thunderbirdPath = thunderbirdPath;
+            this.output = output;
+            this.bucketSeconds = bucketSeconds;
+            this.bglSampleModulo = bglSampleModulo;
+            this.thunderbirdSampleModulo = thunderbirdSampleModulo;
+            this.trainFraction = trainFraction;
+            this.validationFraction = validationFraction;
+            this.topK = topK;
+            this.rareEventMaxTrainCount = rareEventMaxTrainCount;
+            this.drainSimilarity = drainSimilarity;
+            this.numberOfTrees = numberOfTrees;
+            this.sampleSize = sampleSize;
+            this.outputAfter = outputAfter;
+            this.zFactor = zFactor;
+            this.seed = seed;
+            this.progressInterval = progressInterval;
+            this.top = top;
+            this.includeUngated = includeUngated;
+            this.contextAnomalyRates = contextAnomalyRates;
+            this.thresholdMode = thresholdMode;
+            this.fdrQValues = fdrQValues;
+            this.statsPeriod = statsPeriod;
+            this.scoreMode = scoreMode;
+            this.rollingHorizonBuckets = rollingHorizonBuckets;
+            this.rollingBins = rollingBins;
+            this.rollingScoreMax = rollingScoreMax;
+            this.excludeAlertUpdates = excludeAlertUpdates;
+            this.expandBuckets = expandBuckets;
+            this.tailBlockBuckets = tailBlockBuckets;
+            this.tailMinSelected = tailMinSelected;
+            this.tailSignificance = tailSignificance;
+            this.parameterFeatures = parameterFeatures;
+            this.entityBucketCounts = entityBucketCounts;
+            this.diagnosticRecallTarget = diagnosticRecallTarget;
+            this.diagnosticTopTemplates = diagnosticTopTemplates;
+            this.diagnosticSamples = diagnosticSamples;
+            this.seedExpandPairs = seedExpandPairs;
+            this.diagnosticQuantile = diagnosticQuantile;
+        }
+
+        private static Config parse(String[] args) {
+            Map<String, String> values = new LinkedHashMap<>();
+            for (int i = 0; i < args.length; i++) {
+                String arg = args[i];
+                if (!arg.startsWith("--") || i + 1 >= args.length) {
+                    throw new IllegalArgumentException("expected --key value near " + arg);
+                }
+                values.put(arg.substring(2), args[++i]);
+            }
+            String root = values.getOrDefault("data-root", "/tmp/loghub_data");
+            return new Config(split(values.getOrDefault("datasets", "bgl,thunderbird")),
+                    values.getOrDefault("bgl", root + "/BGL/BGL.log"),
+                    values.getOrDefault("thunderbird", root + "/Thunderbird/Thunderbird.log"),
+                    values.getOrDefault("output", "benchmark-results/log-ad/line_level_log_anomaly_results.csv"),
+                    Integer.parseInt(values.getOrDefault("bucket-seconds", "600")),
+                    Integer.parseInt(values.getOrDefault("bgl-sample-modulo", "1")),
+                    Integer.parseInt(values.getOrDefault("thunderbird-sample-modulo", "10")),
+                    Double.parseDouble(values.getOrDefault("train-fraction", "0.10")),
+                    Double.parseDouble(values.getOrDefault("validation-fraction", "0.10")),
+                    Integer.parseInt(values.getOrDefault("top-k", "25")),
+                    Integer.parseInt(values.getOrDefault("rare-max-train-count", "5")),
+                    Double.parseDouble(values.getOrDefault("drain-similarity", "0.5")),
+                    Integer.parseInt(values.getOrDefault("trees", "100")),
+                    Integer.parseInt(values.getOrDefault("sample-size", "256")),
+                    Integer.parseInt(values.getOrDefault("output-after", "32")),
+                    Double.parseDouble(values.getOrDefault("z-factor", "3.0")),
+                    Long.parseLong(values.getOrDefault("seed", "42")),
+                    Integer.parseInt(values.getOrDefault("progress-interval", "5000000")),
+                    Integer.parseInt(values.getOrDefault("top", "20")),
+                    Boolean.parseBoolean(values.getOrDefault("include-ungated", "true")),
+                    splitDoubles(values.getOrDefault("context-anomaly-rates", "0.02,0.05,0.10,0.20")),
+                    values.getOrDefault("threshold-mode", "supervised").toLowerCase(Locale.ROOT),
+                    splitDoubles(values.getOrDefault("fdr-q", "0.20,0.30,0.40,0.50,0.60")),
+                    values.getOrDefault("stats-period", "train").toLowerCase(Locale.ROOT),
+                    values.getOrDefault("score-mode", "combined").toLowerCase(Locale.ROOT),
+                    Integer.parseInt(values.getOrDefault("rolling-horizon-buckets", "144")),
+                    Integer.parseInt(values.getOrDefault("rolling-bins", "4096")),
+                    Double.parseDouble(values.getOrDefault("rolling-score-max", "80.0")),
+                    Boolean.parseBoolean(values.getOrDefault("exclude-alert-updates", "true")),
+                    Integer.parseInt(values.getOrDefault("expand-buckets", "2")),
+                    Integer.parseInt(values.getOrDefault("tail-block-buckets", "144")),
+                    Integer.parseInt(values.getOrDefault("tail-min-selected", "5")),
+                    Double.parseDouble(values.getOrDefault("tail-significance", "0.05")),
+                    Boolean.parseBoolean(values.getOrDefault("parameter-features", "false")),
+                    Boolean.parseBoolean(values.getOrDefault("entity-bucket-counts", "false")),
+                    Double.parseDouble(values.getOrDefault("diagnostic-recall-target", "0.50")),
+                    Integer.parseInt(values.getOrDefault("diagnostic-top-templates", values.getOrDefault("top", "20"))),
+                    Integer.parseInt(values.getOrDefault("diagnostic-samples", "3")),
+                    splitQuantilePairs(values.getOrDefault("seed-expand-pairs", "0.999:0.99,0.999:0.995,0.9995:0.995")),
+                    Double.parseDouble(values.getOrDefault("diagnostic-quantile", "NaN")));
+        }
+
+        private boolean useParameterFeatures() {
+            return parameterFeatures || scoreMode.contains("param") || scoreMode.contains("tiebreak")
+                    || scoreMode.startsWith("bgl_") || useSemanticFeatures();
+        }
+
+        private boolean useEntityBucketCounts() {
+            return entityBucketCounts || scoreMode.contains("spike") || scoreMode.contains("tiebreak")
+                    || scoreMode.startsWith("bgl_") || scoreMode.equals("combined") || useSemanticFeatures();
+        }
+
+        private boolean useSemanticFeatures() {
+            return scoreMode.contains("semantic");
+        }
+
+        private boolean storeLineMessages() {
+            return "diagnostic".equals(thresholdMode);
+        }
+
+        private static List<String> split(String csv) {
+            List<String> result = new ArrayList<>();
+            for (String item : csv.split(",")) {
+                String trimmed = item.trim().toLowerCase(Locale.ROOT);
+                if (!trimmed.isEmpty()) {
+                    result.add(trimmed);
+                }
+            }
+            return result;
+        }
+
+        private static List<Double> splitDoubles(String csv) {
+            List<Double> result = new ArrayList<>();
+            for (String item : csv.split(",")) {
+                String trimmed = item.trim();
+                if (!trimmed.isEmpty()) {
+                    result.add(Double.parseDouble(trimmed));
+                }
+            }
+            return result;
+        }
+
+        private static List<QuantilePair> splitQuantilePairs(String csv) {
+            List<QuantilePair> result = new ArrayList<>();
+            for (String item : csv.split(",")) {
+                String trimmed = item.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                String[] parts = trimmed.split(":");
+                if (parts.length != 2) {
+                    throw new IllegalArgumentException("expected seed:expand pair, got " + trimmed);
+                }
+                result.add(new QuantilePair(Double.parseDouble(parts[0]), Double.parseDouble(parts[1])));
+            }
+            return result;
+        }
+    }
+
+    private static final class QuantilePair {
+        private final double seedQuantile;
+        private final double expandQuantile;
+
+        private QuantilePair(double seedQuantile, double expandQuantile) {
+            this.seedQuantile = seedQuantile;
+            this.expandQuantile = expandQuantile;
+        }
+    }
+}

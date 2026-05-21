@@ -85,14 +85,104 @@ public class LogRecordNormalizer {
 
     public String canonicalize(String value) {
         String answer = value == null ? "" : value;
-        answer = UUID.matcher(answer).replaceAll("<uuid>");
-        answer = IP.matcher(answer).replaceAll("<ip>");
-        answer = QUOTED_STRING.matcher(answer).replaceAll("<str>");
-        answer = HEX.matcher(answer).replaceAll("<hex>");
-        answer = LONG_NUMBER.matcher(answer).replaceAll("<num>");
+        if (hasDigit(answer)) {
+            if (hasAtLeast(answer, '-', 4)) {
+                answer = UUID.matcher(answer).replaceAll("<uuid>");
+            }
+            if (answer.indexOf('.') >= 0) {
+                answer = IP.matcher(answer).replaceAll("<ip>");
+            }
+            if (hasLikelyHexToken(answer)) {
+                answer = HEX.matcher(answer).replaceAll("<hex>");
+            }
+            answer = LONG_NUMBER.matcher(answer).replaceAll("<num>");
+        }
+        if (answer.indexOf('"') >= 0 || answer.indexOf('\'') >= 0) {
+            answer = QUOTED_STRING.matcher(answer).replaceAll("<str>");
+        }
         answer = answer.toLowerCase(Locale.ROOT);
-        answer = WHITESPACE.matcher(answer).replaceAll(" ").trim();
-        return answer;
+        return collapseWhitespace(answer);
+    }
+
+    private boolean hasDigit(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isDigit(value.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasAtLeast(String value, char target, int minimum) {
+        int count = 0;
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) == target && ++count >= minimum) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasLikelyHexToken(String value) {
+        int runLength = 0;
+        boolean hasHexLetter = false;
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            boolean hexDigit = current >= '0' && current <= '9' || current >= 'a' && current <= 'f'
+                    || current >= 'A' && current <= 'F';
+            if (hexDigit) {
+                ++runLength;
+                hasHexLetter = hasHexLetter || current >= 'a' && current <= 'f' || current >= 'A' && current <= 'F';
+                if (runLength >= 8 && hasHexLetter) {
+                    return true;
+                }
+            } else if (current == 'x' || current == 'X') {
+                if (i > 0 && value.charAt(i - 1) == '0') {
+                    return true;
+                }
+                runLength = 0;
+                hasHexLetter = false;
+            } else {
+                runLength = 0;
+                hasHexLetter = false;
+            }
+        }
+        return false;
+    }
+
+    private String collapseWhitespace(String value) {
+        int start = 0;
+        int end = value.length() - 1;
+        while (start <= end && Character.isWhitespace(value.charAt(start))) {
+            ++start;
+        }
+        while (end >= start && Character.isWhitespace(value.charAt(end))) {
+            --end;
+        }
+        if (start > end) {
+            return "";
+        }
+        StringBuilder builder = null;
+        boolean previousWhitespace = false;
+        for (int i = start; i <= end; i++) {
+            char current = value.charAt(i);
+            if (Character.isWhitespace(current)) {
+                if (!previousWhitespace) {
+                    if (builder == null) {
+                        builder = new StringBuilder(value.length());
+                        builder.append(value, start, i);
+                    }
+                    builder.append(' ');
+                    previousWhitespace = true;
+                }
+            } else {
+                if (builder != null) {
+                    builder.append(current);
+                }
+                previousWhitespace = false;
+            }
+        }
+        return builder == null ? value.substring(start, end + 1) : builder.toString();
     }
 
     private Map<String, String> parseJsonFields(String raw) {
@@ -118,6 +208,9 @@ public class LogRecordNormalizer {
     }
 
     private Map<String, String> parseKeyValueFields(String raw) {
+        if (raw.indexOf('=') < 0) {
+            return Collections.emptyMap();
+        }
         Matcher matcher = KEY_VALUE_FIELD.matcher(raw);
         Map<String, String> fields = new LinkedHashMap<>();
         int firstStart = -1;
@@ -202,10 +295,32 @@ public class LogRecordNormalizer {
     }
 
     private boolean containsWord(String text, String word) {
-        return Pattern.compile("(^|[^a-z0-9_])" + Pattern.quote(word) + "([^a-z0-9_]|$)").matcher(text).find();
+        int from = 0;
+        while (from < text.length()) {
+            int index = text.indexOf(word, from);
+            if (index < 0) {
+                return false;
+            }
+            int before = index - 1;
+            int after = index + word.length();
+            if ((before < 0 || !isWordCharacter(text.charAt(before)))
+                    && (after >= text.length() || !isWordCharacter(text.charAt(after)))) {
+                return true;
+            }
+            from = index + 1;
+        }
+        return false;
+    }
+
+    private boolean isWordCharacter(char value) {
+        return value == '_' || value >= 'a' && value <= 'z' || value >= '0' && value <= '9';
     }
 
     private String extractException(String raw) {
+        if (raw.indexOf("Exception") < 0 && raw.indexOf("Error") < 0 && raw.indexOf("exception") < 0
+                && raw.indexOf("error") < 0) {
+            return null;
+        }
         Matcher matcher = FULL_EXCEPTION.matcher(checkNotNull(raw, "raw must not be null"));
         if (matcher.find()) {
             return matcher.group().toLowerCase(Locale.ROOT);

@@ -1,0 +1,7 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+thunderbird,tail_excess_global_rarity_keyword_b144,none,1.000000,1,0.500000,1349601,1.000000,162251,4378669,61737,14066632,0.035731,0.724374,0.068102
+thunderbird,conditional_tail_excess_global_rarity_keyword_b144,none,1.000000,1,0.500000,1349601,1.000000,813,7789648,223175,10655653,0.000104,0.003630,0.000203
+thunderbird,tail_seed_expand_global_rarity_keyword_b144_e2,none,1.000000,1,0.500000,1349601,1.000000,162253,4647797,61735,13797504,0.033732,0.724383,0.064462
+thunderbird,tail_excess_global_rarity_keyword_b144,none,1.000000,1,0.600000,1349601,1.000000,120853,2711641,103135,15733660,0.042667,0.539551,0.079080
+thunderbird,conditional_tail_excess_global_rarity_keyword_b144,none,1.000000,1,0.600000,1349601,1.000000,807,7515756,223181,10929545,0.000107,0.003603,0.000209
+thunderbird,tail_seed_expand_global_rarity_keyword_b144_e2,none,1.000000,1,0.600000,1349601,1.000000,120853,2736547,103135,15708754,0.042295,0.539551,0.078441

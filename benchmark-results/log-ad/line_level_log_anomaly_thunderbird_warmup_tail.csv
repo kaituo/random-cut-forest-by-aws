@@ -1,0 +1,10 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+thunderbird,tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.500000,2450198,1.000000,211514,4425146,12474,14020155,0.045618,0.944310,0.087031
+thunderbird,conditional_tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.500000,2450198,1.000000,140993,9693907,82995,8751394,0.014336,0.629467,0.028034
+thunderbird,tail_seed_expand_global_rarity_keyword_tiebreak_b144_e2,none,1.000000,1,0.500000,2450198,1.000000,211542,4437135,12446,14008166,0.045506,0.944435,0.086828
+thunderbird,tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.550000,2450198,1.000000,205116,3982849,18872,14462452,0.048977,0.915745,0.092982
+thunderbird,conditional_tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.550000,2450198,1.000000,140881,8220243,83107,10225058,0.016850,0.628967,0.032820
+thunderbird,tail_seed_expand_global_rarity_keyword_tiebreak_b144_e2,none,1.000000,1,0.550000,2450198,1.000000,205142,3996582,18846,14448719,0.048823,0.915862,0.092705
+thunderbird,tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.600000,2450198,1.000000,198864,3429683,25124,15015618,0.054805,0.887833,0.103238
+thunderbird,conditional_tail_excess_global_rarity_keyword_tiebreak_b144,none,1.000000,1,0.600000,2450198,1.000000,140803,7723466,83185,10721835,0.017904,0.628618,0.034817
+thunderbird,tail_seed_expand_global_rarity_keyword_tiebreak_b144_e2,none,1.000000,1,0.600000,2450198,1.000000,200903,3439133,23085,15006168,0.055193,0.896936,0.103986

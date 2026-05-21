@@ -1,0 +1,7 @@
+dataset,model,rows,train_rows,test_rows,positives,negatives,features,auc,seconds
+Thunderbird,Isolation Forest + parsed events,633729,31687,602042,9344,592698,772,0.929831,1.447
+Thunderbird,RCF offline + parsed events,633729,31687,602042,9344,592698,772,0.529614,517.586
+
+model,average_auc
+Isolation Forest + parsed events,0.929831
+RCF offline + parsed events,0.529614

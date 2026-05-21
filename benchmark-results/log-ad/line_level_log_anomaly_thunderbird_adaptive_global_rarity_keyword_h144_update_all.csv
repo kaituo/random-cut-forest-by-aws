@@ -1,0 +1,13 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.001000,49342,1.000000,103,1045,223885,18444256,0.089721,0.000460,0.000915
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.001000,49342,1.000000,0,0,223988,18445301,0.000000,0.000000,0.000000
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.002000,49342,1.000000,351,1596,223637,18443705,0.180277,0.001567,0.003107
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.002000,49342,1.000000,0,0,223988,18445301,0.000000,0.000000,0.000000
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.005000,49342,1.000000,1051,4573,222937,18440728,0.186878,0.004692,0.009155
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.005000,49342,1.000000,0,293,223988,18445008,0.000000,0.000000,0.000000
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.010000,49342,1.000000,1773,10982,222215,18434319,0.139004,0.007916,0.014978
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.010000,49342,1.000000,0,1067,223988,18444234,0.000000,0.000000,0.000000
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.020000,49342,1.000000,3803,19045,220185,18426256,0.166448,0.016979,0.030814
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.020000,49342,1.000000,0,3152,223988,18442149,0.000000,0.000000,0.000000
+thunderbird,rolling_line_bh_global_rarity_keyword_h144,none,1.000000,1,0.050000,49342,1.000000,12416,68789,211572,18376512,0.152897,0.055432,0.081365
+thunderbird,rolling_conditional_bh_global_rarity_keyword_h144,none,1.000000,1,0.050000,49342,1.000000,30,46428,223958,18398873,0.000646,0.000134,0.000222

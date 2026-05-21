@@ -1,0 +1,5 @@
+dataset,input,bucket_seconds,buckets,positive_buckets,logs,anomalous_logs
+bgl,/tmp/loghub_data/BGL/BGL.log,600,10555,933,4747963,348460
+
+detector,evaluated_buckets,positive_buckets,predicted_buckets,tp,fp,fn,tn,precision,recall,f1,avg_ms_per_bucket,avg_us_per_log,state
+Drain_RCF,10475,914,5507,807,4700,107,4861,0.146541,0.882932,0.251363,1.730948,3.912450,templates=211,rcf=50x128,shingle=4

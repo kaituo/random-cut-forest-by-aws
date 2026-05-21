@@ -1,0 +1,3 @@
+name,evaluated,positive,predicted,tp,fp,fn,tn,precision,recall,f1,max_score,max_threshold,elapsed_s,state
+BGL_10m_node_GLAD_entity,2350718,185272,146470,27908,118562,157364,2046884,0.190537,0.150633,0.168251,10.000000,12.547140,21.979,capacity=5000,z=1.20,templates=215,clusters=1
+BGL_10m_node_GLAD_bucket,10475,914,5375,609,4766,305,4795,0.113302,0.666302,0.193671,0.000000,0.000000,21.979,capacity=5000,z=1.20,templates=215,clusters=1

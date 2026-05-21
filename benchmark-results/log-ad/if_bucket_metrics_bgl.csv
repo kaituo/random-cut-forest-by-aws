@@ -1,0 +1,4 @@
+dataset,model,records,train_records,test_records,positives,predicted,tp,fp,fn,tn,precision,recall,f1,k,precision_at_k,recall_at_k
+bgl,Isolation Forest + Representation A rarity-only,10555,1055,9500,829,829,172,657,657,8014,0.207479,0.207479,0.207479,829,0.207479,0.207479
+bgl,Isolation Forest + Representation B top-50 counts + rarity,10555,1055,9500,829,829,310,519,519,8152,0.373945,0.373945,0.373945,829,0.373945,0.373945
+bgl,Isolation Forest + Representation C hash buckets,10555,1055,9500,829,829,361,468,468,8203,0.435464,0.435464,0.435464,829,0.435464,0.435464

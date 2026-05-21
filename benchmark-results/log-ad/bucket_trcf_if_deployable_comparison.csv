@@ -1,0 +1,13 @@
+dataset,model,records,train_records,test_records,positives,predicted,tp,fp,fn,tn,precision,recall,f1,k,precision_at_k,recall_at_k
+bgl,TRCF + Representation A rarity-only,10555,1055,9500,829,111,25,86,804,8585,0.225225,0.030157,0.053191,829,0.139928,0.139928
+bgl,TRCF + Representation B top-50 counts + rarity,10555,1055,9500,829,199,71,128,758,8543,0.356784,0.085645,0.138132,829,0.234017,0.234017
+bgl,TRCF + Representation C hash buckets,10555,1055,9500,829,227,83,144,746,8527,0.365639,0.100121,0.157197,829,0.248492,0.248492
+thunderbird,TRCF + Representation A rarity-only,34088,3408,30680,6116,442,84,358,6032,24206,0.190045,0.013734,0.025618,6116,0.167430,0.167430
+thunderbird,TRCF + Representation B top-50 counts + rarity,34088,3408,30680,6116,787,199,588,5917,23976,0.252859,0.032538,0.057656,6116,0.276815,0.276815
+thunderbird,TRCF + Representation C hash buckets,34088,3408,30680,6116,833,147,686,5969,23878,0.176471,0.024035,0.042308,6116,0.206835,0.206835
+bgl,Isolation Forest deployable contamination=0.02 + Representation A rarity-only,10555,1055,9500,829,1325,259,1066,570,7605,0.195472,0.312425,0.240483,829,0.207479,0.207479
+bgl,Isolation Forest deployable contamination=0.02 + Representation B top-50 counts + rarity,10555,1055,9500,829,322,235,87,594,8584,0.729814,0.283474,0.408341,829,0.373945,0.373945
+bgl,Isolation Forest deployable contamination=0.02 + Representation C hash buckets,10555,1055,9500,829,368,262,106,567,8565,0.711957,0.316043,0.437761,829,0.435464,0.435464
+thunderbird,Isolation Forest deployable contamination=0.02 + Representation A rarity-only,34088,3408,30680,6116,10001,1122,8879,4994,15685,0.112189,0.183453,0.139232,6116,0.093198,0.093198
+thunderbird,Isolation Forest deployable contamination=0.02 + Representation B top-50 counts + rarity,34088,3408,30680,6116,1514,396,1118,5720,23446,0.261559,0.064748,0.103801,6116,0.241661,0.241661
+thunderbird,Isolation Forest deployable contamination=0.02 + Representation C hash buckets,34088,3408,30680,6116,3999,722,3277,5394,21287,0.180545,0.118051,0.142758,6116,0.173316,0.173316

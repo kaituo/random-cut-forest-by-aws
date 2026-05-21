@@ -1,0 +1,9 @@
+dataset,method,train_setup,records,train_records,test_records,positives,negatives,auc
+HDFS,RCF + parsed events,unfiltered-online,575061,28753,546308,15486,530822,0.992696
+HDFS,RCF + char trigrams,unfiltered-online,575061,28753,546308,15486,530822,0.988433
+HDFS,RCF + words,unfiltered-online,575061,28753,546308,15486,530822,0.989808
+
+method,average_auc
+RCF + parsed events,0.992696
+RCF + char trigrams,0.988433
+RCF + words,0.989808

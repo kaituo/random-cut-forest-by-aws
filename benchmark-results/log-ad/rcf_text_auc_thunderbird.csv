@@ -1,0 +1,9 @@
+dataset,method,train_setup,records,train_records,test_records,positives,negatives,auc
+Thunderbird,RCF + parsed events,unfiltered-online,21119487,1056584,20062903,289556,19773347,0.666265
+Thunderbird,RCF + char trigrams,unfiltered-online,21119487,1056584,20062903,289556,19773347,0.374419
+Thunderbird,RCF + words,unfiltered-online,21119487,1056584,20062903,289556,19773347,0.625462
+
+method,average_auc
+RCF + parsed events,0.666265
+RCF + char trigrams,0.374419
+RCF + words,0.625462

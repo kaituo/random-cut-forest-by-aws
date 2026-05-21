@@ -1,0 +1,6 @@
+dataset,method,records,train_records,test_records,positives,negatives,auc
+BGL,RCF online parsed-event onehot,474998,23673,451325,33094,418231,0.478391
+BGL,RCF online event rarity features,474998,23673,451325,33094,418231,0.424983
+BGL,RCF online event embedding,474998,23673,451325,33094,418231,0.465664
+BGL,RCF online event embedding+rarity,474998,23673,451325,33094,418231,0.434371
+BGL,RCF online template-count window n=1000,476,24,452,136,316,0.688733

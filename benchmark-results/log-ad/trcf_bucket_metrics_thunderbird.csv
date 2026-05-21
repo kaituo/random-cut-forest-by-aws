@@ -1,0 +1,4 @@
+dataset,model,records,train_records,test_records,positives,predicted,tp,fp,fn,tn,precision,recall,f1,k,precision_at_k,recall_at_k
+thunderbird,TRCF + Representation A rarity-only,34088,3408,30680,6116,442,84,358,6032,24206,0.190045,0.013734,0.025618,6116,0.167430,0.167430
+thunderbird,TRCF + Representation B top-50 counts + rarity,34088,3408,30680,6116,787,199,588,5917,23976,0.252859,0.032538,0.057656,6116,0.276815,0.276815
+thunderbird,TRCF + Representation C hash buckets,34088,3408,30680,6116,833,147,686,5969,23878,0.176471,0.024035,0.042308,6116,0.206835,0.206835

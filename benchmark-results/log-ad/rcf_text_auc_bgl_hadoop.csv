@@ -1,0 +1,12 @@
+dataset,method,train_setup,records,train_records,test_records,positives,negatives,auc
+BGL,RCF + parsed events,unfiltered-online,4747963,237398,4510565,331002,4179563,0.500311
+BGL,RCF + char trigrams,unfiltered-online,4747963,237398,4510565,331002,4179563,0.464406
+BGL,RCF + words,unfiltered-online,4747963,237398,4510565,331002,4179563,0.475027
+Hadoop,RCF + parsed events,unfiltered-online,55,27,28,24,4,0.572917
+Hadoop,RCF + char trigrams,unfiltered-online,55,27,28,24,4,0.489583
+Hadoop,RCF + words,unfiltered-online,55,27,28,24,4,0.447917
+
+method,average_auc
+RCF + parsed events,0.536614
+RCF + char trigrams,0.476995
+RCF + words,0.461472

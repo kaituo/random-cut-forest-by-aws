@@ -1,0 +1,7 @@
+dataset,model,rows,train_rows,test_rows,positives,negatives,features,auc,seconds
+BGL,Isolation Forest + parsed events,474167,23709,450458,33302,417156,217,0.722898,1.086
+BGL,RCF offline + parsed events,474167,23709,450458,33302,417156,217,0.725579,81.391
+
+model,average_auc
+Isolation Forest + parsed events,0.722898
+RCF offline + parsed events,0.725579

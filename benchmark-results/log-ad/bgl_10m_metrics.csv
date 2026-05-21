@@ -1,0 +1,8 @@
+dataset,input,bucket_seconds,buckets,positive_buckets,logs,anomalous_logs
+bgl,/tmp/loghub_data/BGL/BGL.log,600,10555,933,4747963,348460
+
+detector,evaluated_buckets,positive_buckets,predicted_buckets,tp,fp,fn,tn,precision,recall,f1,avg_ms_per_bucket,avg_us_per_log,state
+current_LogAnomalyDetector,10475,914,5501,803,4698,111,4863,0.145973,0.878556,0.250351,5.227784,11.816328,rcf=50x128,shingle=4
+current_LogAnomalyDetector_updateBaseline,10475,914,2643,641,2002,273,7559,0.242527,0.701313,0.360416,5.189415,11.729603,rcf=50x128,shingle=4
+Drain_signal_EWMA_no_RCF,10475,914,1706,585,1121,329,8440,0.342907,0.640044,0.446565,0.875867,1.979716,templates=211,rcf=none
+Drain_template_EWMA_no_RCF,10475,914,793,298,495,616,9066,0.375788,0.326039,0.349151,0.845011,1.909973,templates=211,per_template_ewma,rcf=none

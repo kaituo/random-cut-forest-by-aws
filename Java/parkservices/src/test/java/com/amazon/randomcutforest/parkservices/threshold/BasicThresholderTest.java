@@ -32,6 +32,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import com.amazon.randomcutforest.config.TransformMethod;
+import com.amazon.randomcutforest.parkservices.state.threshold.BasicThresholderMapper;
+import com.amazon.randomcutforest.parkservices.state.threshold.BasicThresholderState;
 import com.amazon.randomcutforest.statistics.Deviation;
 
 public class BasicThresholderTest {
@@ -127,6 +129,51 @@ public class BasicThresholderTest {
         assertTrue(thresholder.longTermDeviation(TransformMethod.NONE, 2) > 0);
         assertTrue(thresholder.longTermDeviation(TransformMethod.DIFFERENCE, 2) > 0);
         assertTrue(thresholder.longTermDeviation(TransformMethod.NORMALIZE_DIFFERENCE, 2) > 0);
+    }
+
+    @Test
+    void rateControlTest() {
+        BasicThresholder highRate = new BasicThresholder(0.01, 0.005, true);
+        highRate.setRateControlMinimumSamples(5);
+        for (int i = 0; i < 10; i++) {
+            highRate.updateAnomalyRate(true);
+        }
+        assertTrue(highRate.getObservedAnomalyRate() > highRate.getTargetAnomalyRate());
+        assertTrue(highRate.getThresholdScale() > 1.0);
+
+        BasicThresholder lowRate = new BasicThresholder(0.01, 0.005, true);
+        lowRate.setRateControlMinimumSamples(5);
+        for (int i = 0; i < 10; i++) {
+            lowRate.updateAnomalyRate(false);
+        }
+        assertTrue(lowRate.getObservedAnomalyRate() < lowRate.getTargetAnomalyRate());
+        assertTrue(lowRate.getThresholdScale() < 1.0);
+    }
+
+    @Test
+    void rateControlledThresholdTest() {
+        BasicThresholder thresholder = new BasicThresholder(0.01, 0.005, true);
+        thresholder.setRateControlMinimumSamples(1);
+        thresholder.setRateControlCount(1);
+        thresholder.setLogThresholdScale(Math.log(2.0));
+        assertEquals(3.0, thresholder.getThresholdAndGrade(2.0, TransformMethod.NONE, 1, 1).index, 1e-10);
+    }
+
+    @Test
+    void rateControlStateTest() {
+        BasicThresholder thresholder = new BasicThresholder(0.01, 0.005, true);
+        thresholder.setRateControlMinimumSamples(5);
+        for (int i = 0; i < 10; i++) {
+            thresholder.updateAnomalyRate(true);
+        }
+        BasicThresholderMapper mapper = new BasicThresholderMapper();
+        BasicThresholderState state = mapper.toState(thresholder);
+        BasicThresholder restored = mapper.toModel(state, 0);
+        assertEquals(thresholder.getTargetAnomalyRate(), restored.getTargetAnomalyRate(), 1e-10);
+        assertEquals(thresholder.getObservedAnomalyRate(), restored.getObservedAnomalyRate(), 1e-10);
+        assertEquals(thresholder.getRateControlCount(), restored.getRateControlCount());
+        assertEquals(thresholder.getLogThresholdScale(), restored.getLogThresholdScale(), 1e-10);
+        assertEquals(thresholder.getRateControlMinimumSamples(), restored.getRateControlMinimumSamples());
     }
 
 }

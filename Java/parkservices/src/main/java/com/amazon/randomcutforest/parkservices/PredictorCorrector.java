@@ -121,6 +121,7 @@ public class PredictorCorrector {
         this.thresholders = new BasicThresholder[NUMBER_OF_MODES];
         thresholders[0] = new BasicThresholder(timeDecay, anomalyRate, adjust);
         thresholders[1] = new BasicThresholder(timeDecay);
+        thresholders[1].setTargetAnomalyRate(anomalyRate);
         this.baseDimension = baseDimension;
         this.randomSeed = randomSeed;
         this.autoAdjust = adjust;
@@ -150,6 +151,7 @@ public class PredictorCorrector {
         Deviation deviation = thresholders[0].getPrimaryDeviation();
         for (int i = size; i < NUMBER_OF_MODES; i++) {
             this.thresholders[i] = new BasicThresholder(thresholders[0].getPrimaryDeviation().getDiscount());
+            this.thresholders[i].setTargetAnomalyRate(thresholders[0].getTargetAnomalyRate());
         }
         this.deviationsActual = new Deviation[baseDimension];
         this.deviationsExpected = new Deviation[baseDimension];
@@ -949,6 +951,7 @@ public class PredictorCorrector {
 
         result.setAnomalyGrade(workingGrade);
         result.setInHighScoreRegion(inHighScoreRegion);
+        updateRateControl(workingGrade > 0);
 
         if (workingGrade > 0) {
             if (expectedPoint != null) {
@@ -975,6 +978,12 @@ public class PredictorCorrector {
         lastDescriptor = result.copyOf();
         saveScores(strategy, choice, scoreVector, correctedScore, result.getTransformMethod(), shingleSize);
         return result;
+    }
+
+    protected void updateRateControl(boolean finalGradePositive) {
+        for (BasicThresholder thresholder : thresholders) {
+            thresholder.updateAnomalyRate(finalGradePositive);
+        }
     }
 
     public void setZfactor(double factor) {

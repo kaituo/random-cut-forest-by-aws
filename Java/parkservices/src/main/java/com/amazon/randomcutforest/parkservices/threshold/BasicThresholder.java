@@ -39,6 +39,11 @@ public class BasicThresholder {
     public static double MINIMUM_Z_FACTOR = 2.0;
     public static boolean DEFAULT_AUTO_THRESHOLD = true;
     public static int DEFAULT_DEVIATION_STATES = 3;
+    public static double DEFAULT_RATE_CONTROL_LEARNING_RATE = 0.02;
+    public static double DEFAULT_RATE_CONTROL_MIN_THRESHOLD_SCALE = 0.25;
+    public static double DEFAULT_RATE_CONTROL_MAX_THRESHOLD_SCALE = 10.0;
+    public static double DEFAULT_RATE_CONTROL_ERROR_CLAMP = 1.0;
+    public static int DEFAULT_RATE_CONTROL_MINIMUM_SAMPLES = 100;
 
     // keeping a count of the values seen because both deviation variables
     // primaryDeviation
@@ -72,16 +77,36 @@ public class BasicThresholder {
     // potential anomaly
     protected double zFactor = DEFAULT_Z_FACTOR;
 
+    // Target long-run emitted anomaly grade rate. The final emitted grade is
+    // observed by PredictorCorrector, while this class owns the threshold state.
+    protected double targetAnomalyRate = 0.0;
+
+    protected double observedAnomalyRate = 0.0;
+
+    protected long rateControlCount = 0;
+
+    protected double logThresholdScale = 0.0;
+
+    protected int rateControlMinimumSamples = DEFAULT_RATE_CONTROL_MINIMUM_SAMPLES;
+
+    protected double rateControlLearningRate = DEFAULT_RATE_CONTROL_LEARNING_RATE;
+
+    protected double minThresholdScale = DEFAULT_RATE_CONTROL_MIN_THRESHOLD_SCALE;
+
+    protected double maxThresholdScale = DEFAULT_RATE_CONTROL_MAX_THRESHOLD_SCALE;
+
     public BasicThresholder(double primaryDiscount, double secondaryDiscount, boolean adjust) {
         primaryDeviation = new Deviation(primaryDiscount);
         secondaryDeviation = new Deviation(secondaryDiscount);
         // a longer horizon to adjust
         thresholdDeviation = new Deviation(primaryDiscount / 2);
         autoThreshold = adjust;
+        setTargetAnomalyRate(secondaryDiscount);
     }
 
     public BasicThresholder(double discount) {
         this(discount, discount, false);
+        setTargetAnomalyRate(0.0);
     }
 
     public BasicThresholder(Deviation[] deviations) {
@@ -108,6 +133,7 @@ public class BasicThresholder {
         primaryDeviation.setDiscount(rate);
         secondaryDeviation.setDiscount(rate);
         thresholdDeviation.setDiscount(0.1 * rate);
+        setTargetAnomalyRate(rate);
     }
 
     /**
@@ -186,8 +212,10 @@ public class BasicThresholder {
         if (!isDeviationReady() || score <= 0) {
             return new Weighted<Double>(0.0, 0.0f);
         }
-        double threshold = getPrimaryThreshold();
-        float grade = (threshold > 0 && score > threshold) ? (float) getPrimaryGrade(score) : 0f;
+        double threshold = rateControlledThreshold(getPrimaryThreshold());
+        float grade = (threshold > 0 && score > threshold)
+                ? (float) min(1.0, getSurpriseIndex(score, threshold, zFactor, primaryDeviation.getDeviation()))
+                : 0f;
         return new Weighted<>(threshold, grade);
     }
 
@@ -269,6 +297,7 @@ public class BasicThresholder {
         double threshold = (!isDeviationReady()) ? max(initialThreshold, absolute)
                 : max(absolute, intermediateFraction * (primaryDeviation.getMean() + scaledDeviation)
                         + (1 - intermediateFraction) * initialThreshold);
+        threshold = rateControlledThreshold(threshold);
         if (score < threshold || threshold <= 0) {
             return new Weighted<>(threshold, 0);
         } else {
@@ -329,12 +358,58 @@ public class BasicThresholder {
         update(min(score, 2.0), secondScore - lastScore);
     }
 
+    public void updateAnomalyRate(boolean finalGradePositive) {
+        if (!isRateControlEnabled()) {
+            return;
+        }
+        ++rateControlCount;
+        double value = finalGradePositive ? 1.0 : 0.0;
+        double discount = min(0.05, max(targetAnomalyRate, 1.0 / rateControlMinimumSamples));
+        if (rateControlCount == 1) {
+            observedAnomalyRate = value;
+        } else {
+            observedAnomalyRate += discount * (value - observedAnomalyRate);
+        }
+        if (!isRateControlReady()) {
+            return;
+        }
+        double eps = min(1e-6, 0.01 * targetAnomalyRate);
+        double error = Math.log((observedAnomalyRate + eps) / (targetAnomalyRate + eps));
+        error = max(-DEFAULT_RATE_CONTROL_ERROR_CLAMP, min(DEFAULT_RATE_CONTROL_ERROR_CLAMP, error));
+        double lower = Math.log(minThresholdScale);
+        double upper = Math.log(maxThresholdScale);
+        double learningRate = (error > 0) ? rateControlLearningRate : 0.5 * rateControlLearningRate;
+        logThresholdScale = max(lower, min(upper, logThresholdScale + learningRate * error));
+    }
+
+    protected double rateControlledThreshold(double threshold) {
+        return (isRateControlReady() && threshold > 0) ? threshold * Math.exp(logThresholdScale) : threshold;
+    }
+
+    protected boolean isRateControlReady() {
+        return isRateControlEnabled() && rateControlCount >= rateControlMinimumSamples;
+    }
+
+    protected boolean isRateControlEnabled() {
+        return targetAnomalyRate > 0 && targetAnomalyRate < 1 && minThresholdScale > 0
+                && maxThresholdScale >= minThresholdScale && rateControlLearningRate >= 0;
+    }
+
     public Deviation getPrimaryDeviation() {
         return primaryDeviation;
     }
 
     public Deviation getSecondaryDeviation() {
         return secondaryDeviation;
+    }
+
+    public void setTargetAnomalyRate(double targetAnomalyRate) {
+        checkArgument(targetAnomalyRate >= 0 && targetAnomalyRate < 1, "anomaly rate must be in [0, 1)");
+        this.targetAnomalyRate = targetAnomalyRate;
+        if (targetAnomalyRate > 0) {
+            rateControlMinimumSamples = max(DEFAULT_RATE_CONTROL_MINIMUM_SAMPLES,
+                    (int) Math.ceil(1.0 / targetAnomalyRate));
+        }
     }
 
     public void setZfactor(double factor) {
@@ -406,6 +481,83 @@ public class BasicThresholder {
 
     public double getZFactor() {
         return zFactor;
+    }
+
+    public double getTargetAnomalyRate() {
+        return targetAnomalyRate;
+    }
+
+    public double getObservedAnomalyRate() {
+        return observedAnomalyRate;
+    }
+
+    public void setObservedAnomalyRate(double observedAnomalyRate) {
+        checkArgument(observedAnomalyRate >= 0 && observedAnomalyRate <= 1, "observed anomaly rate must be in [0, 1]");
+        this.observedAnomalyRate = observedAnomalyRate;
+    }
+
+    public long getRateControlCount() {
+        return rateControlCount;
+    }
+
+    public void setRateControlCount(long rateControlCount) {
+        checkArgument(rateControlCount >= 0, "rate control count must be non-negative");
+        this.rateControlCount = rateControlCount;
+    }
+
+    public double getLogThresholdScale() {
+        return logThresholdScale;
+    }
+
+    public void setLogThresholdScale(double logThresholdScale) {
+        checkArgument(
+                logThresholdScale >= Math.log(minThresholdScale) && logThresholdScale <= Math.log(maxThresholdScale),
+                "log threshold scale is out of range");
+        this.logThresholdScale = logThresholdScale;
+    }
+
+    public double getThresholdScale() {
+        return Math.exp(logThresholdScale);
+    }
+
+    public int getRateControlMinimumSamples() {
+        return rateControlMinimumSamples;
+    }
+
+    public void setRateControlMinimumSamples(int rateControlMinimumSamples) {
+        checkArgument(rateControlMinimumSamples >= 0, "rate control minimum samples must be non-negative");
+        this.rateControlMinimumSamples = rateControlMinimumSamples;
+    }
+
+    public double getRateControlLearningRate() {
+        return rateControlLearningRate;
+    }
+
+    public void setRateControlLearningRate(double rateControlLearningRate) {
+        checkArgument(rateControlLearningRate >= 0, "rate control learning rate must be non-negative");
+        this.rateControlLearningRate = rateControlLearningRate;
+    }
+
+    public double getMinThresholdScale() {
+        return minThresholdScale;
+    }
+
+    public void setMinThresholdScale(double minThresholdScale) {
+        checkArgument(minThresholdScale > 0 && minThresholdScale <= maxThresholdScale,
+                "min threshold scale must be positive and no larger than max threshold scale");
+        this.minThresholdScale = minThresholdScale;
+        logThresholdScale = max(Math.log(minThresholdScale), logThresholdScale);
+    }
+
+    public double getMaxThresholdScale() {
+        return maxThresholdScale;
+    }
+
+    public void setMaxThresholdScale(double maxThresholdScale) {
+        checkArgument(maxThresholdScale >= minThresholdScale,
+                "max threshold scale must be at least min threshold scale");
+        this.maxThresholdScale = maxThresholdScale;
+        logThresholdScale = min(Math.log(maxThresholdScale), logThresholdScale);
     }
 
     public int getMinimumScores() {

@@ -1,0 +1,4 @@
+dataset,model,records,train_records,test_records,positives,predicted,tp,fp,fn,tn,precision,recall,f1,k,precision_at_k,recall_at_k
+bgl,TRCF + Representation A rarity-only,10555,1055,9500,829,111,25,86,804,8585,0.225225,0.030157,0.053191,829,0.139928,0.139928
+bgl,TRCF + Representation B top-50 counts + rarity,10555,1055,9500,829,199,71,128,758,8543,0.356784,0.085645,0.138132,829,0.234017,0.234017
+bgl,TRCF + Representation C hash buckets,10555,1055,9500,829,227,83,144,746,8527,0.365639,0.100121,0.157197,829,0.248492,0.248492
