@@ -1,0 +1,2 @@
+dataset,score,context,context_anomaly_rate,context_shingle,evaluated_lines,positives,best_precision_at_recall_0_5,best_recall_at_precision_0_5,best_f1,best_f1_precision,best_f1_recall,average_precision,target_feasible
+bgl,online_decayed_online_composite_update_q0.99500,none,1.000000,1,3762990,123539,0.167631,0.007520,0.290087,0.226612,0.402958,0.210202,false

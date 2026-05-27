@@ -1,0 +1,2 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+thunderbird,online_decayed_global_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_static,none,1.000000,1,0.995000,2682151,1.000000,197354,190494,1841,18047647,0.508844,0.990758,0.672366

@@ -1,0 +1,2 @@
+dataset,score,context,context_anomaly_rate,context_shingle,evaluated_lines,positives,best_precision_at_recall_0_5,best_recall_at_precision_0_5,best_f1,best_f1_precision,best_f1_recall,average_precision,target_feasible
+thunderbird,online_decayed_global_rarity_keyword_tiebreak_update_q0.99500,none,1.000000,1,20018890,288978,0.896992,0.993449,0.928236,0.871238,0.993214,0.777940,true

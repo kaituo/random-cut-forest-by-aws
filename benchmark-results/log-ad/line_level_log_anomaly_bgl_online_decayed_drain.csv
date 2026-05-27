@@ -1,0 +1,4 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+bgl,online_decayed_combined_slow7.00d_fast6.00h_q1.00d,none,1.000000,1,0.990000,984973,1.000000,123539,2803117,0,836334,0.042212,1.000000,0.081004
+bgl,online_decayed_combined_slow7.00d_fast6.00h_q1.00d,none,1.000000,1,0.995000,984973,1.000000,123539,1974996,0,1664455,0.058869,1.000000,0.111193
+bgl,online_decayed_combined_slow7.00d_fast6.00h_q1.00d,none,1.000000,1,0.999000,984973,1.000000,123255,1686625,284,1952826,0.068101,0.997701,0.127500

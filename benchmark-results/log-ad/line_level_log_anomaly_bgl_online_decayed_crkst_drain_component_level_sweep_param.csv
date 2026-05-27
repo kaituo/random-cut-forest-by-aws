@@ -1,0 +1,3 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+bgl,online_decayed_component_rarity_keyword_stable_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_component_level_min200,none,1.000000,1,0.995000,984973,1.000000,87870,167979,35669,3471472,0.343445,0.711273,0.463220
+bgl,online_decayed_component_rarity_keyword_stable_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_component_level_min200,none,1.000000,1,0.996000,984973,1.000000,12803,15776,110736,3623675,0.447986,0.103635,0.168330

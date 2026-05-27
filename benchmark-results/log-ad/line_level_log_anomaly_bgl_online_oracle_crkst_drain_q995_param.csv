@@ -1,0 +1,2 @@
+dataset,score,context,context_anomaly_rate,context_shingle,evaluated_lines,positives,best_precision_at_recall_0_5,best_recall_at_precision_0_5,best_f1,best_f1_precision,best_f1_recall,average_precision,target_feasible
+bgl,online_decayed_component_rarity_keyword_stable_tiebreak_update_q0.99500,none,1.000000,1,3762990,123539,0.768670,0.766964,0.647465,0.599725,0.703462,0.545424,true

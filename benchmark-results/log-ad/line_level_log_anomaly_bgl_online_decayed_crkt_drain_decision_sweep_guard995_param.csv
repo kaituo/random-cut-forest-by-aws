@@ -1,0 +1,6 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+bgl,online_decayed_component_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_global_guard0.99500,none,1.000000,1,0.990000,984973,1.000000,102807,332764,20732,3306687,0.236028,0.832183,0.367752
+bgl,online_decayed_component_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_global_guard0.99500,none,1.000000,1,0.990500,984973,1.000000,96865,319398,26674,3320053,0.232701,0.784084,0.358891
+bgl,online_decayed_component_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_global_guard0.99500,none,1.000000,1,0.991000,984973,1.000000,95013,309335,28526,3330116,0.234978,0.769093,0.359975
+bgl,online_decayed_component_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_global_guard0.99500,none,1.000000,1,0.991500,984973,1.000000,93929,296085,29610,3343366,0.240835,0.760319,0.365801
+bgl,online_decayed_component_rarity_keyword_tiebreak_slow7.00d_fast6.00h_q1.00d_counts_online_thr_global_guard0.99500,none,1.000000,1,0.992000,984973,1.000000,76254,275037,47285,3364414,0.217068,0.617246,0.321184

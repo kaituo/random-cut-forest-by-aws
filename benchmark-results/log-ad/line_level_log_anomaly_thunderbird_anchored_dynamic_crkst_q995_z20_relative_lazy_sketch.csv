@@ -1,0 +1,2 @@
+dataset,method,context,context_anomaly_rate,context_shingle,q,calibration_hypotheses,context_line_recall,tp,fp,fn,tn,precision,recall,f1
+thunderbird,anchored_dynamic_component_rarity_keyword_stable_tiebreak_wq0.99500_z2.00_h7.00d_counts_online_thr_global_shrink1000_log1p_parentfloor_relative_strict,none,1.000000,1,0.995000,2682151,1.000000,173131,220160,26064,18017981,0.440211,0.869153,0.584422

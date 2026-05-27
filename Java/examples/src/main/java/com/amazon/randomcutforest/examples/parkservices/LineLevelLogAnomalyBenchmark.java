@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -65,6 +66,13 @@ public final class LineLevelLogAnomalyBenchmark {
             }
             writeOracleResults(config.output, results);
             printOracleSummary(results, config.top);
+        } else if ("online-oracle".equals(config.thresholdMode)) {
+            List<OracleResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetOnlineOracle(datasetName, config));
+            }
+            writeOracleResults(config.output, results);
+            printOracleSummary(results, config.top);
         } else if ("adaptive".equals(config.thresholdMode)) {
             List<FdrResult> results = new ArrayList<>();
             for (String datasetName : config.datasets) {
@@ -86,6 +94,31 @@ public final class LineLevelLogAnomalyBenchmark {
             }
             writeFdrResults(config.output, results);
             printFdrSummary(results, config.top);
+        } else if ("online".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetOnlineDecayed(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("anchored-dynamic".equals(config.thresholdMode)
+                || "anchored_dynamic".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetAnchoredDynamic(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("anchored-online".equals(config.thresholdMode)
+                || "anchored_online".equals(config.thresholdMode)) {
+            List<FdrResult> results = new ArrayList<>();
+            for (String datasetName : config.datasets) {
+                results.addAll(evaluateDatasetAnchoredOnline(datasetName, config));
+            }
+            writeFdrResults(config.output, results);
+            printFdrSummary(results, config.top);
+        } else if ("predict".equals(config.thresholdMode)) {
+            writePredictionDumps(config);
         } else if ("topk".equals(config.thresholdMode)) {
             List<FdrResult> results = new ArrayList<>();
             for (String datasetName : config.datasets) {
@@ -107,6 +140,60 @@ public final class LineLevelLogAnomalyBenchmark {
             }
             writeResults(config.output, results);
             printSummary(results, config.top);
+        }
+    }
+
+    private static void writePredictionDumps(Config config) throws IOException {
+        Path path = Paths.get(config.output);
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(PredictionRecord.header());
+            writer.newLine();
+            for (String datasetName : config.datasets) {
+                writeDatasetPredictions(datasetName, config, writer);
+            }
+        }
+    }
+
+    private static void writeDatasetPredictions(String datasetName, Config config, BufferedWriter writer)
+            throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        int warmupEnd = max(1, min(dataset.buckets.size() - 1,
+                (int) Math.floor(config.trainFraction * dataset.buckets.size())));
+        int scoreEnd = min(dataset.buckets.size(),
+                warmupEnd + max(1, (int) Math.floor(config.predictionFraction * dataset.buckets.size())));
+        TrainStats stats = TrainStats.fromRange(dataset, 0, warmupEnd, config);
+        ContextSet context = ContextSet.all("none", dataset.buckets.size());
+        double[] warmupScores = calibrationLineScores(dataset, stats, context, 0, warmupEnd, config);
+        java.util.Arrays.sort(warmupScores);
+        System.out.printf(Locale.ROOT,
+                "prediction_dump dataset=%s warmup_buckets=[0,%d) score_buckets=[%d,%d) warmup_lines=%d score_lines=%d%n",
+                datasetName, warmupEnd, warmupEnd, scoreEnd, dataset.countLines(0, warmupEnd),
+                dataset.countLines(warmupEnd, scoreEnd));
+        for (double quantile : config.fdrQValues) {
+            double threshold = quantile(warmupScores, quantile);
+            Metrics metrics = new Metrics(0, 0, 0, 0);
+            for (int bucketIndex = warmupEnd; bucketIndex < scoreEnd; bucketIndex++) {
+                Bucket bucket = dataset.buckets.get(bucketIndex);
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    double score = lineScore(dataset, stats, context, i, config.scoreMode);
+                    boolean label = dataset.labels.values[i] != 0;
+                    boolean prediction = score >= threshold;
+                    metrics.add(label, prediction);
+                    writer.write(new PredictionRecord(datasetName, quantile, threshold, i, bucketIndex,
+                            bucket.bucketKey, dataset.entityIds.values[i], dataset.componentIds.values[i],
+                            dataset.levelIds.values[i], dataset.eventIds.values[i], score, prediction, label,
+                            dataset).toCsv());
+                    writer.newLine();
+                }
+            }
+            System.out.printf(Locale.ROOT,
+                    "prediction_summary dataset=%s q=%.5f threshold=%.8f tp=%d fp=%d fn=%d tn=%d precision=%.6f recall=%.6f f1=%.6f%n",
+                    datasetName, quantile, threshold, metrics.tp, metrics.fp, metrics.fn, metrics.tn,
+                    metrics.precision(), metrics.recall(), metrics.f1());
         }
     }
 
@@ -247,6 +334,721 @@ public final class LineLevelLogAnomalyBenchmark {
             }
         }
         return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetOnlineDecayed(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        int warmupEnd = split.trainEnd;
+        OnlineBaselineState seed = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+        OnlineThresholdState seedThresholds = new OnlineThresholdState(config);
+        int warmupScores = seedOnlineThresholds(dataset, seed, seedThresholds, 0, warmupEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (double quantile : config.fdrQValues) {
+            OnlineBaselineState online = new OnlineBaselineState(seed);
+            OnlineThresholdState thresholds = new OnlineThresholdState(seedThresholds);
+            FdrResult result = evaluateOnlineDecayed(datasetName, dataset, online, thresholds, quantile, warmupEnd,
+                    dataset.buckets.size(), warmupScores, config);
+            results.add(result);
+            System.out.println(result.toCsv());
+        }
+        return results;
+    }
+
+    private static List<OracleResult> evaluateDatasetOnlineOracle(String datasetName, Config config) throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        int warmupEnd = split.trainEnd;
+        OnlineBaselineState seed = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+        OnlineThresholdState seedThresholds = new OnlineThresholdState(config);
+        seedOnlineThresholds(dataset, seed, seedThresholds, 0, warmupEnd, config);
+        List<OracleResult> results = new ArrayList<>();
+        for (double quantile : config.fdrQValues) {
+            OnlineBaselineState online = new OnlineBaselineState(seed);
+            OnlineThresholdState thresholds = new OnlineThresholdState(seedThresholds);
+            OracleResult result = evaluateOnlineOracle(datasetName, dataset, online, thresholds, quantile, warmupEnd,
+                    dataset.buckets.size(), config);
+            results.add(result);
+            System.out.println(result.toCsv());
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetAnchoredDynamic(String datasetName, Config config)
+            throws IOException {
+        Dataset dataset = loadDataset(datasetName, config);
+        Split split = Split.from(dataset, config);
+        int warmupEnd = split.trainEnd;
+        OnlineBaselineState seed = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+        List<FdrResult> results = new ArrayList<>();
+        for (double quantile : config.fdrQValues) {
+            AnchoredDynamicThresholdState thresholds = AnchoredDynamicThresholdState.fromWarmup(dataset, seed, 0,
+                    warmupEnd, quantile, config);
+            OnlineBaselineState online = new OnlineBaselineState(seed);
+            FdrResult result = evaluateAnchoredDynamic(datasetName, dataset, online, thresholds, quantile, warmupEnd,
+                    dataset.buckets.size(), dataset.countLines(0, warmupEnd), config, config.scoreMode,
+                    "anchored_dynamic");
+            results.add(result);
+            System.out.println(result.toCsv());
+        }
+        return results;
+    }
+
+    private static List<FdrResult> evaluateDatasetAnchoredOnline(String datasetName, Config config)
+            throws IOException {
+        long phaseStart = System.nanoTime();
+        Dataset dataset = loadDataset(datasetName, config);
+        printOnlinePhase(datasetName, "load", phaseStart, config);
+        Split split = Split.from(dataset, config);
+        int warmupEnd = split.trainEnd;
+        if (config.anchorCalibrationFraction >= 1.0) {
+            phaseStart = System.nanoTime();
+            OnlineBaselineState seed = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+            printOnlinePhase(datasetName, "seed_full_warmup", phaseStart, config);
+            phaseStart = System.nanoTime();
+            AnchoredOnlineSelection selection = selectAnchoredOnline(datasetName, dataset, seed, 0, warmupEnd, config,
+                    false);
+            printOnlinePhase(datasetName, "select_score_anchor", phaseStart, config);
+            phaseStart = System.nanoTime();
+            AnchoredDynamicThresholdState thresholds = AnchoredDynamicThresholdState.fromWarmup(dataset, seed, 0,
+                    warmupEnd, selection.anchorQuantile, config, selection.scoreMode, selection.anchorThreshold, false);
+            printOnlinePhase(datasetName, "seed_thresholds", phaseStart, config);
+            phaseStart = System.nanoTime();
+            OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+            printOnlinePhase(datasetName, "seed_eval_baseline", phaseStart, config);
+            FdrResult result = evaluateAnchoredDynamic(datasetName, dataset, online, thresholds,
+                    selection.anchorQuantile, warmupEnd, dataset.buckets.size(), dataset.countLines(0, warmupEnd),
+                    config, selection.scoreMode, selection.methodPrefix());
+            List<FdrResult> results = new ArrayList<>();
+            results.add(result);
+            System.out.println(result.toCsv());
+            return results;
+        }
+        int calibrationBuckets = max(1, (int) Math.ceil(config.anchorCalibrationFraction * warmupEnd));
+        int countWarmupEnd = max(1, warmupEnd - calibrationBuckets);
+        if (countWarmupEnd >= warmupEnd) {
+            countWarmupEnd = max(1, warmupEnd - 1);
+        }
+        phaseStart = System.nanoTime();
+        OnlineBaselineState countSeed = OnlineBaselineState.fromWarmup(dataset, 0, countWarmupEnd, config);
+        printOnlinePhase(datasetName, "seed_count_warmup", phaseStart, config);
+        phaseStart = System.nanoTime();
+        AnchoredOnlineSelection selection = selectAnchoredOnline(datasetName, dataset, countSeed, countWarmupEnd,
+                warmupEnd, config, true);
+        printOnlinePhase(datasetName, "select_score_anchor", phaseStart, config);
+        OnlineBaselineState thresholdSeed = new OnlineBaselineState(countSeed);
+        phaseStart = System.nanoTime();
+        AnchoredDynamicThresholdState thresholds = AnchoredDynamicThresholdState.fromWarmup(dataset, thresholdSeed,
+                countWarmupEnd, warmupEnd, selection.anchorQuantile, config, selection.scoreMode,
+                selection.anchorThreshold, true);
+        printOnlinePhase(datasetName, "seed_thresholds", phaseStart, config);
+        phaseStart = System.nanoTime();
+        OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+        printOnlinePhase(datasetName, "seed_eval_baseline", phaseStart, config);
+        FdrResult result = evaluateAnchoredDynamic(datasetName, dataset, online, thresholds, selection.anchorQuantile,
+                warmupEnd, dataset.buckets.size(), dataset.countLines(countWarmupEnd, warmupEnd), config,
+                selection.scoreMode, selection.methodPrefix());
+        List<FdrResult> results = new ArrayList<>();
+        results.add(result);
+        System.out.println(result.toCsv());
+        return results;
+    }
+
+    private static void printOnlinePhase(String datasetName, String phase, long startNanos, Config config) {
+        if (config.profileOnline) {
+            System.out.printf(Locale.ROOT, "online_profile_phase dataset=%s phase=%s seconds=%.3f%n", datasetName,
+                    phase, secondsSince(startNanos));
+        }
+    }
+
+    private static FdrResult evaluateAnchoredDynamic(String datasetName, Dataset dataset, OnlineBaselineState online,
+            AnchoredDynamicThresholdState thresholds, double warmupQuantile, int startBucket, int endBucket,
+            int calibrationHypotheses, Config config, String scoreMode, String methodPrefix) {
+        if (config.profileMaxEvalBuckets > 0) {
+            endBucket = min(endBucket, startBucket + config.profileMaxEvalBuckets);
+            System.out.printf(Locale.ROOT,
+                    "online_profile_limited_eval dataset=%s start_bucket=%d end_bucket=%d max_eval_buckets=%d lines=%d%n",
+                    datasetName, startBucket, endBucket, config.profileMaxEvalBuckets,
+                    dataset.countLines(startBucket, endBucket));
+        }
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        OnlineProfile profile = config.profileOnline ? new OnlineProfile(datasetName, startBucket, endBucket, config)
+                : null;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            long timer = System.nanoTime();
+            online.advanceTo(bucketKey);
+            if (profile != null) {
+                profile.countAdvanceNanos += System.nanoTime() - timer;
+            }
+            timer = System.nanoTime();
+            thresholds.advanceTo(bucketKey);
+            if (profile != null) {
+                profile.thresholdAdvanceNanos += System.nanoTime() - timer;
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                timer = System.nanoTime();
+                double rawScore = onlineDecayedLineScore(dataset, online, i, config, scoreMode);
+                double score = anchoredThresholdScore(rawScore, config);
+                if (profile != null) {
+                    profile.scoreNanos += System.nanoTime() - timer;
+                }
+                timer = System.nanoTime();
+                double threshold = thresholds.threshold(dataset, i, bucketKey);
+                if (profile != null) {
+                    profile.thresholdNanos += System.nanoTime() - timer;
+                }
+                boolean prediction = onlinePrediction(score, threshold, config);
+                if (profile != null) {
+                    profile.recordDecision(dataset, i, score, threshold, prediction,
+                            thresholds.lastThresholdAnchorControlled());
+                }
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+                if (config.onlineUpdateThresholds) {
+                    double updateScore = prediction && config.onlineWinsorizeThresholdUpdates ? min(score, threshold)
+                            : score;
+                    timer = System.nanoTime();
+                    thresholds.update(dataset, i, updateScore, bucketKey);
+                    if (profile != null) {
+                        profile.thresholdUpdateNanos += System.nanoTime() - timer;
+                    }
+                }
+                if (config.onlineUpdateCounts) {
+                    timer = System.nanoTime();
+                    online.updateAfterDecision(dataset, i, prediction, config);
+                    if (profile != null) {
+                        profile.countUpdateNanos += System.nanoTime() - timer;
+                    }
+                }
+                if (profile != null) {
+                    profile.lines++;
+                    profile.maybeReport(bucketIndex, online);
+                }
+            }
+        }
+        if (profile != null) {
+            profile.report("final", endBucket - 1, online);
+        }
+        String method = String.format(Locale.ROOT,
+                "%s_%s_wq%.5f_z%.2f_h%.2fd_counts_%s_thr_%s_shrink%.0f", methodPrefix, scoreMode,
+                warmupQuantile, config.zFactor, config.anchoredThresholdHalfLifeDays,
+                config.onlineUpdateCounts ? "online" : "static",
+                config.onlineUpdateThresholds ? AnchoredDynamicThresholdState.effectiveGroupMode(config) : "static",
+                config.anchoredThresholdShrinkageK);
+        if (config.anchoredLogScores) {
+            method += "_log1p";
+        }
+        if (config.anchoredThresholdFloorParent) {
+            method += "_parentfloor";
+        }
+        method += "_" + config.anchoredThresholdDynamicMode;
+        if (config.onlineStrictThreshold) {
+            method += "_strict";
+        }
+        return new FdrResult(datasetName, method, "none", 1.0, 1, warmupQuantile, calibrationHypotheses, 1.0,
+                metrics);
+    }
+
+    private static int seedOnlineThresholds(Dataset dataset, OnlineBaselineState seed,
+            OnlineThresholdState thresholds, int startBucket, int endBucket, Config config) {
+        int count = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            thresholds.advanceTo(bucketKey);
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                thresholds.update(dataset, i, onlineDecayedLineScore(dataset, seed, i, config), bucketKey);
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    private static FdrResult evaluateOnlineDecayed(String datasetName, Dataset dataset, OnlineBaselineState online,
+            OnlineThresholdState thresholds, double quantile, int startBucket, int endBucket,
+            int calibrationHypotheses, Config config) {
+        Metrics metrics = new Metrics(0, 0, 0, 0);
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            online.advanceTo(bucketKey);
+            thresholds.advanceTo(bucketKey);
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                double threshold = thresholds.quantile(dataset, i, quantile, bucketKey);
+                double score = onlineDecayedLineScore(dataset, online, i, config);
+                boolean prediction = onlinePrediction(score, threshold, config);
+                boolean updatePrediction = onlineUpdatePrediction(thresholds, dataset, i, quantile, bucketKey, score,
+                        threshold, config);
+                metrics.add(dataset.labels.values[i] != 0, prediction);
+                if (config.onlineUpdateThresholds) {
+                    updateOnlineThreshold(thresholds, dataset, i, bucketKey, score, threshold, updatePrediction,
+                            config);
+                }
+                if (config.onlineUpdateCounts) {
+                    online.updateAfterDecision(dataset, i, updatePrediction, config);
+                }
+            }
+        }
+        String method = String.format(Locale.ROOT, "online_decayed_%s_slow%.2fd_fast%.2fh_q%.2fd_counts_%s_thr_%s",
+                config.scoreMode, config.onlineTemplateHalfLifeDays, config.onlineFastHalfLifeHours,
+                config.onlineQuantileHalfLifeDays, config.onlineUpdateCounts ? "online" : "static",
+                config.onlineUpdateThresholds ? config.onlineThresholdGroup : "static");
+        if (config.onlineUpdateThresholds && !"global".equals(config.onlineThresholdGroup)) {
+            method += "_min" + config.onlineThresholdMinCount;
+        }
+        if (Double.isFinite(config.onlineUpdateGuardQuantile)) {
+            method += String.format(Locale.ROOT, "_guard%.5f", config.onlineUpdateGuardQuantile);
+        }
+        if (Math.abs(config.onlineTiebreakWeight - 0.001) > 1.0e-12) {
+            method += String.format(Locale.ROOT, "_tb%.4f", config.onlineTiebreakWeight);
+        }
+        if (config.onlineStrictThreshold) {
+            method += "_strict";
+        }
+        return new FdrResult(datasetName, method, "none", 1.0, 1, quantile, calibrationHypotheses, 1.0, metrics);
+    }
+
+    private static OracleResult evaluateOnlineOracle(String datasetName, Dataset dataset, OnlineBaselineState online,
+            OnlineThresholdState thresholds, double updateQuantile, int startBucket, int endBucket, Config config) {
+        int count = dataset.countLines(startBucket, endBucket);
+        long[] packed = new long[count];
+        int index = 0;
+        long positives = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            online.advanceTo(bucketKey);
+            thresholds.advanceTo(bucketKey);
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                double threshold = thresholds.quantile(dataset, i, updateQuantile, bucketKey);
+                double score = onlineDecayedLineScore(dataset, online, i, config);
+                boolean label = dataset.labels.values[i] != 0;
+                packed[index++] = pack(score, label);
+                if (label) {
+                    ++positives;
+                }
+                boolean prediction = onlinePrediction(score, threshold, config);
+                boolean updatePrediction = onlineUpdatePrediction(thresholds, dataset, i, updateQuantile, bucketKey,
+                        score, threshold, config);
+                if (config.onlineUpdateThresholds) {
+                    updateOnlineThreshold(thresholds, dataset, i, bucketKey, score, threshold, updatePrediction,
+                            config);
+                }
+                if (config.onlineUpdateCounts) {
+                    online.updateAfterDecision(dataset, i, updatePrediction, config);
+                }
+            }
+        }
+        String scoreName = String.format(Locale.ROOT, "online_decayed_%s_update_q%.5f", config.scoreMode,
+                updateQuantile);
+        return oracleFromPacked(datasetName, scoreName, "none", 1.0, 1, packed, index, positives);
+    }
+
+    private static void updateOnlineThreshold(OnlineThresholdState thresholds, Dataset dataset, int lineIndex,
+            long bucketKey, double score, double threshold, boolean prediction, Config config) {
+        if (!prediction || !config.excludeAlertUpdates) {
+            thresholds.update(dataset, lineIndex, score, bucketKey);
+        } else if (score <= threshold + config.onlineWinsorizeScoreMargin) {
+            thresholds.update(dataset, lineIndex, score, bucketKey);
+        } else if (config.onlineWinsorizeThresholdUpdates && Double.isFinite(threshold)) {
+            thresholds.update(dataset, lineIndex, min(score, threshold), bucketKey);
+        }
+    }
+
+    private static boolean onlinePrediction(double score, double threshold, Config config) {
+        return config.onlineStrictThreshold ? score > threshold : score >= threshold;
+    }
+
+    private static double anchoredThresholdScore(double score, Config config) {
+        double clean = Double.isFinite(score) ? max(0.0, score) : config.rollingScoreMax;
+        return config.anchoredLogScores ? Math.log1p(clean) : clean;
+    }
+
+    private static AnchoredOnlineSelection selectAnchoredOnline(String datasetName, Dataset dataset,
+            OnlineBaselineState countSeed, int startBucket, int endBucket, Config config, boolean updateSeed) {
+        List<String> candidates = anchoredScoreCandidates(config);
+        AnchoredOnlineSelection best = null;
+        for (String scoreMode : candidates) {
+            TailKneeDiagnostic diagnostic = tailKneeDiagnostic(dataset, new OnlineBaselineState(countSeed), startBucket,
+                    endBucket, scoreMode, config, updateSeed);
+            AnchoredOnlineSelection selection = new AnchoredOnlineSelection(scoreMode,
+                    AnchoredDynamicThresholdState.effectiveGroupMode(config), diagnostic.quantile,
+                    diagnostic.threshold, diagnostic.quality, diagnostic);
+            System.out.printf(Locale.ROOT,
+                    "anchored_online_candidate dataset=%s score_mode=%s anchor_q=%.6f anchor=%.8f quality=%.6f knee=%.6f stability=%.6f concentration=%.6f tail_count=%d%n",
+                    datasetName, scoreMode, diagnostic.quantile, diagnostic.threshold, diagnostic.quality,
+                    diagnostic.kneeStrength, diagnostic.stability, diagnostic.concentration, diagnostic.tailCount);
+            if (best == null || selection.quality > best.quality) {
+                best = selection;
+            }
+        }
+        if (best == null) {
+            throw new IllegalStateException("no anchored-online score candidates");
+        }
+        System.out.printf(Locale.ROOT,
+                "anchored_online_selected dataset=%s score_mode=%s threshold_group=%s anchor_q=%.6f anchor=%.8f quality=%.6f%n",
+                datasetName, best.scoreMode, best.thresholdGroup, best.anchorQuantile, best.anchorThreshold,
+                best.quality);
+        return best;
+    }
+
+    private static List<String> anchoredScoreCandidates(Config config) {
+        List<String> result = new ArrayList<>();
+        if (!"auto".equals(config.scoreMode)) {
+            result.add(config.scoreMode);
+            return result;
+        }
+        result.add("global_rarity_keyword_tiebreak");
+        result.add("component_rarity_keyword_stable_tiebreak");
+        return result;
+    }
+
+    private static TailKneeDiagnostic tailKneeDiagnostic(Dataset dataset, OnlineBaselineState online, int startBucket,
+            int endBucket, String scoreMode, Config config, boolean updateSeed) {
+        OnlineBaselineState base = new OnlineBaselineState(online);
+        List<Double> cappedScores = new ArrayList<>();
+        List<Double> allScores = new ArrayList<>();
+        Map<Long, Integer> signatureCounts = new HashMap<>();
+        OnlineThresholdState histogramAnchor = config.useHistogramAnchorQuantile(scoreMode)
+                ? new OnlineThresholdState(config) : null;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            if (updateSeed) {
+                online.advanceTo(bucketKey);
+            }
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                double rawScore = onlineDecayedLineScore(dataset, online, i, config, scoreMode);
+                double score = anchoredThresholdScore(rawScore, config);
+                allScores.add(score);
+                if (histogramAnchor != null) {
+                    histogramAnchor.update(dataset, i, rawScore, bucketKey);
+                }
+                long key = thresholdSelectionSignature(dataset, i);
+                int seen = signatureCounts.getOrDefault(key, 0);
+                if (seen < config.anchorSignatureCap) {
+                    cappedScores.add(score);
+                }
+                signatureCounts.put(key, seen + 1);
+                if (updateSeed) {
+                    online.update(dataset, i, 1.0, 1.0, 1.0);
+                }
+            }
+        }
+        if (allScores.isEmpty()) {
+            return new TailKneeDiagnostic(0.995, 0.0, 0.0, 0.0, 1.0, 0, 0.0);
+        }
+        Collections.sort(allScores);
+        Collections.sort(cappedScores);
+        List<Double> selectionScores = cappedScores.isEmpty() ? allScores : cappedScores;
+        int n = selectionScores.size();
+        int start = min(max((int) Math.floor(config.anchorMinQuantile * n), 0), max(0, n - 2));
+        int end = min(max((int) Math.ceil(config.anchorMaxQuantile * n), start + 1), n - 1);
+        double tailScale = tailScale(selectionScores, start, end);
+        double bestScore = -1.0;
+        double bestGap = -1.0;
+        double bestSupport = 1.0;
+        int bestIndex = start;
+        for (int i = start; i < end; i++) {
+            double gap = selectionScores.get(i + 1) - selectionScores.get(i);
+            double q = (i + 1.0) / n;
+            double support = max(0.02, (1.0 - q) / max(1.0e-6, 1.0 - config.anchorMinQuantile));
+            double adjusted = gap * support;
+            if (adjusted > bestScore) {
+                bestScore = adjusted;
+                bestGap = adjusted;
+                bestSupport = support;
+                bestIndex = i;
+            }
+        }
+        double threshold = selectionScores.get(bestIndex);
+        double quantile = actualQuantile(allScores, threshold);
+        if (config.useFixedAnchorQuantile() || config.useHistogramAnchorQuantile(scoreMode)) {
+            quantile = config.fixedAnchorQuantile();
+            threshold = config.useHistogramAnchorQuantile(scoreMode)
+                    ? anchoredThresholdScore(histogramAnchor.global.quantile(quantile), config)
+                    : listQuantile(allScores, quantile);
+        } else {
+            quantile = max(config.anchorMinQuantile, min(config.anchorMaxQuantile, quantile));
+            quantile = min(quantile, scoreFamilyMaxAnchorQuantile(scoreMode, config));
+            threshold = listQuantile(allScores, quantile);
+        }
+        int tailCount = countAboveOrEqual(dataset, base, startBucket, endBucket, scoreMode, threshold, config);
+        double concentration = tailConcentration(dataset, base, startBucket, endBucket, scoreMode, threshold, config,
+                max(1, tailCount));
+        double stability = tailStability(dataset, base, startBucket, endBucket, scoreMode, quantile, threshold,
+                config);
+        double kneeStrength = bestGap / max(1.0e-6, tailScale);
+        double usefulTail = 1.0 / (1.0 + Math.abs(Math.log(max(1.0e-6, 1.0 - quantile) / 0.01)));
+        double quality = kneeStrength + stability + 0.25 * usefulTail - 0.75 * concentration + 0.10 * bestSupport;
+        return new TailKneeDiagnostic(quantile, threshold, kneeStrength, stability, concentration, tailCount, quality);
+    }
+
+    private static double scoreFamilyMaxAnchorQuantile(String scoreMode, Config config) {
+        if (config.useFixedAnchorQuantile()) {
+            return config.anchorMaxQuantile;
+        }
+        if (scoreMode.startsWith("component_")) {
+            return config.anchorMinQuantile;
+        }
+        return min(config.anchorMaxQuantile, 0.995);
+    }
+
+    private static long thresholdSelectionSignature(Dataset dataset, int lineIndex) {
+        int componentId = dataset.componentIds.values[lineIndex];
+        int levelId = dataset.levelIds.values[lineIndex];
+        int eventId = dataset.eventIds.values[lineIndex];
+        long key = 1469598103934665603L;
+        key = (key ^ componentId) * 1099511628211L;
+        key = (key ^ levelId) * 1099511628211L;
+        key = (key ^ eventId) * 1099511628211L;
+        return key;
+    }
+
+    private static double tailScale(List<Double> sorted, int start, int end) {
+        if (end <= start) {
+            return 1.0;
+        }
+        List<Double> gaps = new ArrayList<>();
+        for (int i = start; i < end; i++) {
+            gaps.add(max(0.0, sorted.get(i + 1) - sorted.get(i)));
+        }
+        Collections.sort(gaps);
+        return max(1.0e-6, gaps.get(gaps.size() / 2));
+    }
+
+    private static double actualQuantile(List<Double> sortedScores, double threshold) {
+        int index = upperBound(sortedScores, threshold);
+        return index / (double) sortedScores.size();
+    }
+
+    private static double secondsSince(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1.0e9;
+    }
+
+    private static double seconds(long nanos) {
+        return nanos / 1.0e9;
+    }
+
+    private static int countAboveOrEqual(Dataset dataset, OnlineBaselineState seed, int startBucket, int endBucket,
+            String scoreMode, double threshold, Config config) {
+        OnlineBaselineState online = new OnlineBaselineState(seed);
+        int count = 0;
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            online.advanceTo(bucketKey);
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                double score = anchoredThresholdScore(onlineDecayedLineScore(dataset, online, i, config, scoreMode),
+                        config);
+                if (score >= threshold) {
+                    ++count;
+                }
+                online.update(dataset, i, 1.0, 1.0, 1.0);
+            }
+        }
+        return count;
+    }
+
+    private static double tailConcentration(Dataset dataset, OnlineBaselineState seed, int startBucket, int endBucket,
+            String scoreMode, double threshold, Config config, int tailCount) {
+        OnlineBaselineState online = new OnlineBaselineState(seed);
+        Map<Long, Integer> counts = new HashMap<>();
+        for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            online.advanceTo(bucketKey);
+            for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                double score = anchoredThresholdScore(onlineDecayedLineScore(dataset, online, i, config, scoreMode),
+                        config);
+                if (score >= threshold) {
+                    long key = thresholdSelectionSignature(dataset, i);
+                    counts.put(key, counts.getOrDefault(key, 0) + 1);
+                }
+                online.update(dataset, i, 1.0, 1.0, 1.0);
+            }
+        }
+        int maxCount = 0;
+        for (int value : counts.values()) {
+            maxCount = max(maxCount, value);
+        }
+        return maxCount / (double) max(1, tailCount);
+    }
+
+    private static double tailStability(Dataset dataset, OnlineBaselineState seed, int startBucket, int endBucket,
+            String scoreMode, double quantile, double globalThreshold, Config config) {
+        int windows = 4;
+        double sum = 0.0;
+        double sumSq = 0.0;
+        int used = 0;
+        for (int w = 0; w < windows; w++) {
+            int from = startBucket + (int) Math.floor((endBucket - startBucket) * (w / (double) windows));
+            int to = startBucket + (int) Math.floor((endBucket - startBucket) * ((w + 1.0) / windows));
+            if (to <= from) {
+                continue;
+            }
+            OnlineBaselineState online = new OnlineBaselineState(seed);
+            List<Double> scores = new ArrayList<>();
+            for (int bucketIndex = startBucket; bucketIndex < to; bucketIndex++) {
+                long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+                online.advanceTo(bucketKey);
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    double score = anchoredThresholdScore(
+                            onlineDecayedLineScore(dataset, online, i, config, scoreMode), config);
+                    if (bucketIndex >= from) {
+                        scores.add(score);
+                    }
+                    online.update(dataset, i, 1.0, 1.0, 1.0);
+                }
+            }
+            if (!scores.isEmpty()) {
+                double value = listQuantile(scores, quantile);
+                sum += value;
+                sumSq += value * value;
+                ++used;
+            }
+        }
+        if (used <= 1) {
+            return 0.0;
+        }
+        double mean = sum / used;
+        double variance = max(0.0, sumSq / used - mean * mean);
+        double cv = Math.sqrt(variance) / max(1.0e-6, Math.abs(globalThreshold));
+        return 1.0 / (1.0 + cv);
+    }
+
+    private static final class AnchoredOnlineSelection {
+        private final String scoreMode;
+        private final String thresholdGroup;
+        private final double anchorQuantile;
+        private final double anchorThreshold;
+        private final double quality;
+        private final TailKneeDiagnostic diagnostic;
+
+        private AnchoredOnlineSelection(String scoreMode, String thresholdGroup, double anchorQuantile,
+                double anchorThreshold, double quality, TailKneeDiagnostic diagnostic) {
+            this.scoreMode = scoreMode;
+            this.thresholdGroup = thresholdGroup;
+            this.anchorQuantile = anchorQuantile;
+            this.anchorThreshold = anchorThreshold;
+            this.quality = quality;
+            this.diagnostic = diagnostic;
+        }
+
+        private String methodPrefix() {
+            return "anchored_online_auto_" + thresholdGroup;
+        }
+    }
+
+    private static final class TailKneeDiagnostic {
+        private final double quantile;
+        private final double threshold;
+        private final double kneeStrength;
+        private final double stability;
+        private final double concentration;
+        private final int tailCount;
+        private final double quality;
+
+        private TailKneeDiagnostic(double quantile, double threshold, double kneeStrength, double stability,
+                double concentration, int tailCount, double quality) {
+            this.quantile = quantile;
+            this.threshold = threshold;
+            this.kneeStrength = kneeStrength;
+            this.stability = stability;
+            this.concentration = concentration;
+            this.tailCount = tailCount;
+            this.quality = quality;
+        }
+    }
+
+    private static final class OnlineProfile {
+        private final String datasetName;
+        private final int startBucket;
+        private final int endBucket;
+        private final int intervalLines;
+        private final long startNanos = System.nanoTime();
+        private long lines;
+        private long lastReportLines;
+        private long countAdvanceNanos;
+        private long thresholdAdvanceNanos;
+        private long scoreNanos;
+        private long thresholdNanos;
+        private long thresholdUpdateNanos;
+        private long countUpdateNanos;
+        private long predictions;
+        private long anchorControlled;
+        private long dynamicControlled;
+        private double scoreSum;
+        private double thresholdSum;
+        private final Map<Integer, Long> predictedTemplates = new HashMap<>();
+
+        private OnlineProfile(String datasetName, int startBucket, int endBucket, Config config) {
+            this.datasetName = datasetName;
+            this.startBucket = startBucket;
+            this.endBucket = endBucket;
+            intervalLines = max(1, config.progressInterval);
+        }
+
+        private void maybeReport(int bucketIndex, OnlineBaselineState online) {
+            if (lines - lastReportLines >= intervalLines) {
+                report("progress", bucketIndex, online);
+                lastReportLines = lines;
+            }
+        }
+
+        private void recordDecision(Dataset dataset, int lineIndex, double score, double threshold, boolean prediction,
+                boolean anchorControlledDecision) {
+            scoreSum += score;
+            thresholdSum += threshold;
+            if (anchorControlledDecision) {
+                ++anchorControlled;
+            } else {
+                ++dynamicControlled;
+            }
+            if (prediction) {
+                ++predictions;
+                int eventId = dataset.eventIds.values[lineIndex];
+                predictedTemplates.put(eventId, predictedTemplates.getOrDefault(eventId, 0L) + 1L);
+            }
+        }
+
+        private void report(String phase, int bucketIndex, OnlineBaselineState online) {
+            double elapsed = secondsSince(startNanos);
+            long measured = countAdvanceNanos + thresholdAdvanceNanos + scoreNanos + thresholdNanos
+                    + thresholdUpdateNanos + countUpdateNanos;
+            System.out.printf(Locale.ROOT,
+                    "online_profile_eval dataset=%s phase=%s buckets=%d/%d lines=%d elapsed=%.3f lines_per_sec=%.1f count_advance=%.3f threshold_advance=%.3f score=%.3f threshold=%.3f threshold_update=%.3f count_update=%.3f measured=%.3f prediction_rate=%.6f anchor_controlled=%.6f dynamic_controlled=%.6f avg_score=%.6f avg_threshold=%.6f top_pred_templates=%s count_state=%s%n",
+                    datasetName, phase, max(0, bucketIndex - startBucket + 1), max(0, endBucket - startBucket),
+                    lines, elapsed, lines / max(1.0e-9, elapsed), seconds(countAdvanceNanos),
+                    seconds(thresholdAdvanceNanos), seconds(scoreNanos), seconds(thresholdNanos),
+                    seconds(thresholdUpdateNanos), seconds(countUpdateNanos), seconds(measured),
+                    predictions / max(1.0, (double) lines), anchorControlled / max(1.0, (double) lines),
+                    dynamicControlled / max(1.0, (double) lines), scoreSum / max(1.0, (double) lines),
+                    thresholdSum / max(1.0, (double) lines), topPredictedTemplates(), online.entrySummary());
+        }
+
+        private String topPredictedTemplates() {
+            if (predictedTemplates.isEmpty()) {
+                return "-";
+            }
+            List<Map.Entry<Integer, Long>> entries = new ArrayList<>(predictedTemplates.entrySet());
+            entries.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
+            StringBuilder builder = new StringBuilder();
+            int limit = min(5, entries.size());
+            for (int i = 0; i < limit; i++) {
+                if (i > 0) {
+                    builder.append(';');
+                }
+                Map.Entry<Integer, Long> entry = entries.get(i);
+                builder.append(entry.getKey()).append(':').append(entry.getValue());
+            }
+            return builder.toString();
+        }
+    }
+
+    private static boolean onlineUpdatePrediction(OnlineThresholdState thresholds, Dataset dataset, int lineIndex,
+            double decisionQuantile, long bucketKey, double score, double decisionThreshold, Config config) {
+        if (!Double.isFinite(config.onlineUpdateGuardQuantile)) {
+            return onlinePrediction(score, decisionThreshold, config);
+        }
+        double guardQuantile = max(0.0, min(1.0, config.onlineUpdateGuardQuantile));
+        double guardThreshold = guardQuantile == decisionQuantile ? decisionThreshold
+                : thresholds.quantile(dataset, lineIndex, guardQuantile, bucketKey);
+        return onlinePrediction(score, guardThreshold, config);
     }
 
     private static List<FdrResult> evaluateDatasetTopKPolicy(String datasetName, Config config) throws IOException {
@@ -1216,6 +2018,50 @@ public final class LineLevelLogAnomalyBenchmark {
                 bestF1Precision, bestF1Recall, averagePrecision, targetFeasible);
     }
 
+    private static OracleResult oracleFromPacked(String datasetName, String scoreName, String contextName,
+            double contextAnomalyRate, int contextShingle, long[] packed, int count, long positives) {
+        if (count == 0 || positives == 0) {
+            return new OracleResult(datasetName, scoreName, contextName, contextAnomalyRate, contextShingle, count,
+                    positives, 0, 0, 0, 0, 0, 0, false);
+        }
+        java.util.Arrays.sort(packed, 0, count);
+        long tp = 0;
+        double bestF1 = 0;
+        double bestF1Precision = 0;
+        double bestF1Recall = 0;
+        double bestPrecisionAtRecall50 = 0;
+        double bestRecallAtPrecision50 = 0;
+        double averagePrecisionNumerator = 0;
+        boolean targetFeasible = false;
+        for (int i = 0; i < count; i++) {
+            if ((packed[i] & 1L) != 0) {
+                ++tp;
+                averagePrecisionNumerator += tp / (double) (i + 1L);
+            }
+            double precision = tp / (double) (i + 1L);
+            double recall = tp / (double) positives;
+            double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+            if (f1 > bestF1) {
+                bestF1 = f1;
+                bestF1Precision = precision;
+                bestF1Recall = recall;
+            }
+            if (recall >= 0.5) {
+                bestPrecisionAtRecall50 = max(bestPrecisionAtRecall50, precision);
+            }
+            if (precision >= 0.5) {
+                bestRecallAtPrecision50 = max(bestRecallAtPrecision50, recall);
+            }
+            if (precision >= 0.5 && recall >= 0.5) {
+                targetFeasible = true;
+            }
+        }
+        double averagePrecision = averagePrecisionNumerator / positives;
+        return new OracleResult(datasetName, scoreName, contextName, contextAnomalyRate, contextShingle, count,
+                positives, bestPrecisionAtRecall50, bestRecallAtPrecision50, bestF1, bestF1Precision, bestF1Recall,
+                averagePrecision, targetFeasible);
+    }
+
     private static LineScorer scorerByName(String name) {
         for (LineScorer scorer : LineScorer.suite()) {
             if (scorer.name().equals(name)) {
@@ -1333,6 +2179,156 @@ public final class LineLevelLogAnomalyBenchmark {
         double contextBoost = context.isPositive(bucketIndex) ? 1.0 : 0.0;
         return 0.5 * templateRarity + 1.4 * signatureRarity + 1.2 * phraseRarity + 0.7 * parameter
                 + 0.8 * entitySpike + keywordBoost + contextBoost - 1.8 * stableSuppression;
+    }
+
+    private static double onlineDecayedLineScore(Dataset dataset, OnlineBaselineState online, int lineIndex,
+            Config config) {
+        return onlineDecayedLineScore(dataset, online, lineIndex, config, config.scoreMode);
+    }
+
+    private static double onlineDecayedLineScore(Dataset dataset, OnlineBaselineState online, int lineIndex,
+            Config config, String scoreMode) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int keyword = dataset.keywordScores.values[lineIndex];
+        switch (scoreMode) {
+        case "global_rarity_keyword":
+            return online.slow.globalRarity(eventId) + 3.0 * keyword;
+        case "global_rarity_keyword_tiebreak":
+            return online.slow.globalRarity(eventId) + 3.0 * keyword
+                    + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        case "global_rarity_keyword_stable_tiebreak":
+            return onlineStableKeywordScore(dataset, online, lineIndex, false, config);
+        case "component_level_rarity_keyword":
+            return online.slow.componentLevelRarity(dataset.componentIds.values[lineIndex],
+                    dataset.levelIds.values[lineIndex], eventId) + 3.0 * keyword;
+        case "component_level_rarity_keyword_tiebreak":
+            return online.slow.componentLevelRarity(dataset.componentIds.values[lineIndex],
+                    dataset.levelIds.values[lineIndex], eventId) + 3.0 * keyword
+                    + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        case "component_rarity_keyword":
+            return online.slow.componentRarity(dataset.componentIds.values[lineIndex], eventId) + 3.0 * keyword;
+        case "component_rarity_keyword_tiebreak":
+            return online.slow.componentRarity(dataset.componentIds.values[lineIndex], eventId) + 3.0 * keyword
+                    + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        case "component_rarity_keyword_stable_tiebreak":
+            return onlineStableKeywordScore(dataset, online, lineIndex, true, config);
+        case "component_level_rarity_keyword_gated":
+            return onlineComponentLevelGatedKeywordScore(dataset, online, lineIndex, false, config);
+        case "component_level_rarity_keyword_gated_tiebreak":
+            return onlineComponentLevelGatedKeywordScore(dataset, online, lineIndex, true, config);
+        case "global_rarity_keyword_gated":
+            return onlineGatedKeywordScore(dataset, online, lineIndex, false, config);
+        case "global_rarity_keyword_gated_tiebreak":
+            return onlineGatedKeywordScore(dataset, online, lineIndex, true, config);
+        case "rarity_keyword":
+            return online.slow.entityRarity(entityId, eventId) + 3.0 * keyword;
+        case "rarity_keyword_tiebreak":
+            return online.slow.entityRarity(entityId, eventId) + 3.0 * keyword
+                    + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        case "global_rarity":
+            return online.slow.globalRarity(eventId);
+        case "rarity":
+            return online.slow.entityRarity(entityId, eventId);
+        case "keyword":
+            return keyword;
+        default:
+            return onlineCompositeLineScore(dataset, online, lineIndex);
+        }
+    }
+
+    private static double onlineGatedKeywordScore(Dataset dataset, OnlineBaselineState online, int lineIndex,
+            boolean includeTieBreak, Config config) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        double rarity = online.slow.globalRarity(eventId);
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double gate = min(1.0, rarity / max(1.0, online.keywordRarityGate));
+        double score = rarity + 3.0 * keyword * gate;
+        if (includeTieBreak) {
+            score += config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        }
+        return score;
+    }
+
+    private static double onlineStableKeywordScore(Dataset dataset, OnlineBaselineState online, int lineIndex,
+            boolean componentRarity, Config config) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        int levelId = dataset.levelIds.values[lineIndex];
+        int phraseHash = dataset.phraseHashes.values[lineIndex];
+        double rarity = componentRarity ? online.slow.componentRarity(componentId, eventId)
+                : online.slow.globalRarity(eventId);
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double stablePenalty = online.stableSuppression(componentId, levelId, phraseHash, eventId);
+        double score = rarity + 3.0 * keyword
+                + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex)
+                - 1.25 * stablePenalty;
+        return max(0.0, score);
+    }
+
+    private static double onlineComponentLevelGatedKeywordScore(Dataset dataset, OnlineBaselineState online,
+            int lineIndex, boolean includeTieBreak, Config config) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        int levelId = dataset.levelIds.values[lineIndex];
+        double rarity = online.slow.componentLevelRarity(componentId, levelId, eventId);
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double gate = min(1.0, rarity / max(1.0, online.keywordRarityGate));
+        double score = rarity + 3.0 * keyword * gate;
+        if (includeTieBreak) {
+            score += config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        }
+        return score;
+    }
+
+    private static double onlineCompositeLineScore(Dataset dataset, OnlineBaselineState online, int lineIndex) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        int levelId = dataset.levelIds.values[lineIndex];
+        int phraseHash = dataset.phraseHashes.values[lineIndex];
+        int parameterHash = dataset.parameterHashes.values[lineIndex];
+        OnlineDecayedStats slow = online.slow;
+        double globalRarity = slow.globalRarity(eventId);
+        double entityRarity = slow.entityRarity(entityId, eventId);
+        double componentRarity = slow.componentRarity(componentId, eventId);
+        double componentLevelRarity = slow.componentLevelRarity(componentId, levelId, eventId);
+        double rarity = min(entityRarity, globalRarity + 2.0);
+        double signatureRarity = slow.semanticSignatureRarity(componentId, levelId, phraseHash);
+        double phraseRarity = slow.phraseRarity(phraseHash);
+        double parameter = slow.parameterRarity(entityId, eventId, parameterHash);
+        double transition = min(12.0, slow.transitionSurprise(dataset.prevEventIds.values[lineIndex], eventId));
+        double templateSpike = online.templateSpike(eventId);
+        double entitySpike = online.entityTemplateSpike(entityId, eventId);
+        double componentLevelSpike = online.componentLevelTemplateSpike(componentId, levelId, eventId);
+        double spike = max(templateSpike, max(entitySpike, componentLevelSpike));
+        double stableSuppression = online.stableSuppression(componentId, levelId, phraseHash, eventId);
+        double noveltyGate = max(max(gate(rarity, 3.0, 10.0), gate(signatureRarity, 3.0, 10.0)),
+                max(gate(parameter, 3.0, 10.0), gate(spike, 0.4, 3.0)));
+        int keyword = dataset.keywordScores.values[lineIndex];
+        double keywordBoost = keyword >= 8 ? 10.0 * noveltyGate
+                : keyword >= 4 ? 4.0 * noveltyGate : keyword > 0 ? 0.6 * noveltyGate : 0.0;
+        double entityExcess = max(0.0, rarity - globalRarity);
+        double score = 0.55 * globalRarity + 0.6 * entityExcess + 0.35 * componentRarity
+                + 0.35 * componentLevelRarity + 1.25 * signatureRarity + 0.9 * phraseRarity
+                + 0.55 * parameter + 1.4 * spike + 0.2 * transition + keywordBoost
+                - 1.5 * stableSuppression;
+        return max(0.0, min(80.0, score));
+    }
+
+    private static double onlineTieBreakScore(Dataset dataset, OnlineBaselineState online, int lineIndex) {
+        int eventId = dataset.eventIds.values[lineIndex];
+        int entityId = dataset.entityIds.values[lineIndex];
+        int componentId = dataset.componentIds.values[lineIndex];
+        OnlineDecayedStats slow = online.slow;
+        double entityRarity = slow.entityRarity(entityId, eventId);
+        double componentRarity = slow.componentRarity(componentId, eventId);
+        double entityGivenTemplate = slow.entityGivenTemplateRarity(entityId, eventId);
+        double parameter = slow.parameterRarity(entityId, eventId, dataset.parameterHashes.values[lineIndex]);
+        double entitySpike = online.entityTemplateSpike(entityId, eventId);
+        double transition = min(12.0, slow.transitionSurprise(dataset.prevEventIds.values[lineIndex], eventId));
+        return entityRarity + 0.5 * componentRarity + 0.5 * entityGivenTemplate + 0.5 * parameter
+                + 2.0 * entitySpike + 0.25 * transition;
     }
 
     private static double gate(double value, double low, double high) {
@@ -1463,12 +2459,36 @@ public final class LineLevelLogAnomalyBenchmark {
         return sortedScores[min(max(index, 0), sortedScores.length - 1)];
     }
 
+    private static double listQuantile(List<Double> scores, double quantile) {
+        if (scores == null || scores.isEmpty()) {
+            return Double.POSITIVE_INFINITY;
+        }
+        Collections.sort(scores);
+        double clean = max(0.0, min(1.0, quantile));
+        int index = (int) Math.ceil(clean * scores.size()) - 1;
+        return scores.get(min(max(index, 0), scores.size() - 1));
+    }
+
     private static int lowerBound(double[] values, double target) {
         int low = 0;
         int high = values.length;
         while (low < high) {
             int middle = (low + high) >>> 1;
             if (values[middle] < target) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    private static int upperBound(List<Double> values, double target) {
+        int low = 0;
+        int high = values.size();
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (values.get(middle) <= target) {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -1895,7 +2915,9 @@ public final class LineLevelLogAnomalyBenchmark {
             System.out.printf(Locale.ROOT, "loading dataset=%s input=%s bucket_seconds=%d sample_modulo=%d%n",
                     datasetName, input, config.bucketSeconds, sampleModulo);
             Dataset dataset = new Dataset();
-            SimpleDrainParser parser = new SimpleDrainParser(config.drainSimilarity);
+            TemplateParser parser = config.useFixedDepthDrainParser()
+                    ? new FixedDepthDrainParser(config.drainSimilarity, config.drainDepth, config.drainMaxChildren)
+                    : new SimpleDrainParser(config.drainSimilarity);
             Map<String, Integer> entityIds = new HashMap<>();
             Map<String, Integer> componentIds = new HashMap<>();
             Map<String, Integer> levelIds = new HashMap<>();
@@ -2355,12 +3377,1237 @@ public final class LineLevelLogAnomalyBenchmark {
         }
     }
 
+    private static final class OnlineBaselineState {
+        private final OnlineDecayedStats slow;
+        private final OnlineDecayedStats fast;
+        private final OnlineDecayedStats stable;
+        private double keywordRarityGate = 1.0;
+
+        private OnlineBaselineState(Config config) {
+            int fastDecayInterval = max(1, min(config.onlineDecayIntervalBuckets,
+                    (int) Math.round(hoursToSeconds(config.onlineFastHalfLifeHours)
+                            / max(1.0, config.bucketSeconds) / 12.0)));
+            slow = new OnlineDecayedStats(daysToSeconds(config.onlineTemplateHalfLifeDays), config.bucketSeconds,
+                    config.onlineDecayIntervalBuckets, config.useParameterFeatures(), config.onlineLazyDecay,
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+            fast = new OnlineDecayedStats(hoursToSeconds(config.onlineFastHalfLifeHours), config.bucketSeconds,
+                    fastDecayInterval, config.useParameterFeatures(), config.onlineLazyDecay,
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+            stable = new OnlineDecayedStats(daysToSeconds(config.onlineStableHalfLifeDays), config.bucketSeconds,
+                    config.onlineDecayIntervalBuckets, config.useParameterFeatures(), config.onlineLazyDecay,
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+        }
+
+        private OnlineBaselineState(OnlineBaselineState other) {
+            slow = new OnlineDecayedStats(other.slow);
+            fast = new OnlineDecayedStats(other.fast);
+            stable = new OnlineDecayedStats(other.stable);
+            keywordRarityGate = other.keywordRarityGate;
+        }
+
+        private static OnlineBaselineState fromWarmup(Dataset dataset, int startBucket, int endBucket, Config config) {
+            OnlineBaselineState state = new OnlineBaselineState(config);
+            for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+                long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+                state.advanceTo(bucketKey);
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    state.update(dataset, i, 1.0, 1.0, 1.0);
+                }
+            }
+            state.keywordRarityGate = keywordRarityGate(dataset, state.slow, startBucket, endBucket, config);
+            return state;
+        }
+
+        private static double keywordRarityGate(Dataset dataset, OnlineDecayedStats stats, int startBucket,
+                int endBucket, Config config) {
+            List<Double> rarities = new ArrayList<>();
+            for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    if (dataset.keywordScores.values[i] > 0) {
+                        rarities.add(stats.globalRarity(dataset.eventIds.values[i]));
+                    }
+                }
+            }
+            if (rarities.isEmpty()) {
+                return 8.0;
+            }
+            Collections.sort(rarities);
+            int index = (int) Math.ceil(max(0.0, min(1.0, config.onlineKeywordGateQuantile)) * rarities.size()) - 1;
+            return max(1.0, rarities.get(min(max(index, 0), rarities.size() - 1)));
+        }
+
+        private void advanceTo(long bucketKey) {
+            slow.advanceTo(bucketKey);
+            fast.advanceTo(bucketKey);
+            stable.advanceTo(bucketKey);
+        }
+
+        private void updateAfterDecision(Dataset dataset, int lineIndex, boolean prediction, Config config) {
+            double guardedWeight = prediction ? config.onlineAlertUpdateWeight : 1.0;
+            update(dataset, lineIndex, guardedWeight, 1.0, guardedWeight);
+        }
+
+        private void update(Dataset dataset, int lineIndex, double slowWeight, double fastWeight,
+                double stableWeight) {
+            slow.update(dataset, lineIndex, slowWeight);
+            fast.update(dataset, lineIndex, fastWeight);
+            stable.update(dataset, lineIndex, stableWeight);
+        }
+
+        private double templateSpike(int eventId) {
+            return ratioSpike(fast.globalProbability(eventId), slow.globalProbability(eventId), fast.globalTotal,
+                    slow.globalTotal);
+        }
+
+        private double entityTemplateSpike(int entityId, int eventId) {
+            return ratioSpike(fast.entityProbability(entityId, eventId), slow.entityProbability(entityId, eventId),
+                    fast.entityTotal(entityId), slow.entityTotal(entityId));
+        }
+
+        private double componentLevelTemplateSpike(int componentId, int levelId, int eventId) {
+            return ratioSpike(fast.componentLevelProbability(componentId, levelId, eventId),
+                    slow.componentLevelProbability(componentId, levelId, eventId),
+                    fast.componentLevelTotal(componentId, levelId), slow.componentLevelTotal(componentId, levelId));
+        }
+
+        private double stableSuppression(int componentId, int levelId, int phraseHash, int eventId) {
+            double eventCount = stable.globalCount(eventId);
+            double eventBuckets = stable.templateBucketCount(eventId);
+            double templateSuppression = eventCount >= 20.0 && eventBuckets >= 5.0
+                    ? min(4.0, 0.4 * Math.log1p(eventCount) + 0.6 * Math.log1p(eventBuckets))
+                    : 0.0;
+            return min(8.0, templateSuppression
+                    + stable.stableSignatureSuppression(componentId, levelId, phraseHash, 20.0, 5.0, 6.0));
+        }
+
+        private static double ratioSpike(double fastProbability, double slowProbability, double fastTotal,
+                double slowTotal) {
+            if (fastTotal < 5.0 || slowTotal < 20.0 || fastProbability <= slowProbability) {
+                return 0.0;
+            }
+            return Math.log1p(max(0.0, fastProbability / max(1.0e-12, slowProbability) - 1.0));
+        }
+
+        private String entrySummary() {
+            return String.format(Locale.ROOT, "slow[%s];fast[%s];stable[%s]", slow.entrySummary(),
+                    fast.entrySummary(), stable.entrySummary());
+        }
+    }
+
+    private static final class OnlineDecayedStats {
+        private static final double PRUNE_BELOW = 1.0e-6;
+        private static final int PARAMETER_VOCABULARY_CAP = 10000;
+
+        private final Map<Integer, Double> globalCounts = new HashMap<>();
+        private final Map<Integer, Double> templateBucketCounts = new HashMap<>();
+        private final Map<Integer, Long> lastTemplateBucket = new HashMap<>();
+        private final Map<Long, Double> entityEventCounts = new HashMap<>();
+        private final Map<Integer, Double> entityTotals = new HashMap<>();
+        private final Map<Long, Double> componentEventCounts = new HashMap<>();
+        private final Map<Integer, Double> componentTotals = new HashMap<>();
+        private final Map<Long, Double> componentLevelEventCounts = new HashMap<>();
+        private final Map<Long, Double> componentLevelTotals = new HashMap<>();
+        private final Map<Long, Double> templateParameterCounts = new HashMap<>();
+        private final Map<Long, Double> entityParameterCounts = new HashMap<>();
+        private final Map<Integer, Double> parameterCounts = new HashMap<>();
+        private final Map<Long, Double> semanticSignatureCounts = new HashMap<>();
+        private final Map<Long, Double> semanticSignatureBucketCounts = new HashMap<>();
+        private final Map<Long, Long> lastSemanticSignatureBucket = new HashMap<>();
+        private final Map<Integer, Double> phraseCounts = new HashMap<>();
+        private final Map<Long, Double> transitionCounts = new HashMap<>();
+        private final Map<Integer, Double> prevTotals = new HashMap<>();
+        private final double halfLifeSeconds;
+        private final int bucketSeconds;
+        private final int decayIntervalBuckets;
+        private final boolean useParameterFeatures;
+        private final boolean lazyDecay;
+        private final boolean sketchParameterPairs;
+        private final CountMinSketchLong templateParameterSketch;
+        private final CountMinSketchLong entityParameterSketch;
+        private double globalTotal;
+        private double scale = 1.0;
+        private int vocabularySize = 1;
+        private int parameterVocabularySize = 1;
+        private int semanticSignatureVocabularySize = 1;
+        private int phraseVocabularySize = 1;
+        private long lastBucketKey = Long.MIN_VALUE;
+
+        private OnlineDecayedStats(double halfLifeSeconds, int bucketSeconds, int decayIntervalBuckets,
+                boolean useParameterFeatures, boolean lazyDecay, boolean sketchParameterPairs, int sketchDepth,
+                int sketchWidth) {
+            this.halfLifeSeconds = max(1.0, halfLifeSeconds);
+            this.bucketSeconds = bucketSeconds;
+            this.decayIntervalBuckets = max(1, decayIntervalBuckets);
+            this.useParameterFeatures = useParameterFeatures;
+            this.lazyDecay = lazyDecay;
+            this.sketchParameterPairs = useParameterFeatures && sketchParameterPairs;
+            templateParameterSketch = this.sketchParameterPairs ? new CountMinSketchLong(sketchDepth, sketchWidth)
+                    : null;
+            entityParameterSketch = this.sketchParameterPairs ? new CountMinSketchLong(sketchDepth, sketchWidth)
+                    : null;
+        }
+
+        private OnlineDecayedStats(OnlineDecayedStats other) {
+            globalCounts.putAll(other.globalCounts);
+            templateBucketCounts.putAll(other.templateBucketCounts);
+            lastTemplateBucket.putAll(other.lastTemplateBucket);
+            entityEventCounts.putAll(other.entityEventCounts);
+            entityTotals.putAll(other.entityTotals);
+            componentEventCounts.putAll(other.componentEventCounts);
+            componentTotals.putAll(other.componentTotals);
+            componentLevelEventCounts.putAll(other.componentLevelEventCounts);
+            componentLevelTotals.putAll(other.componentLevelTotals);
+            templateParameterCounts.putAll(other.templateParameterCounts);
+            entityParameterCounts.putAll(other.entityParameterCounts);
+            parameterCounts.putAll(other.parameterCounts);
+            semanticSignatureCounts.putAll(other.semanticSignatureCounts);
+            semanticSignatureBucketCounts.putAll(other.semanticSignatureBucketCounts);
+            lastSemanticSignatureBucket.putAll(other.lastSemanticSignatureBucket);
+            phraseCounts.putAll(other.phraseCounts);
+            transitionCounts.putAll(other.transitionCounts);
+            prevTotals.putAll(other.prevTotals);
+            halfLifeSeconds = other.halfLifeSeconds;
+            bucketSeconds = other.bucketSeconds;
+            decayIntervalBuckets = other.decayIntervalBuckets;
+            useParameterFeatures = other.useParameterFeatures;
+            lazyDecay = other.lazyDecay;
+            sketchParameterPairs = other.sketchParameterPairs;
+            templateParameterSketch = other.templateParameterSketch == null ? null
+                    : new CountMinSketchLong(other.templateParameterSketch);
+            entityParameterSketch = other.entityParameterSketch == null ? null
+                    : new CountMinSketchLong(other.entityParameterSketch);
+            globalTotal = other.globalTotal;
+            scale = other.scale;
+            vocabularySize = other.vocabularySize;
+            parameterVocabularySize = other.parameterVocabularySize;
+            semanticSignatureVocabularySize = other.semanticSignatureVocabularySize;
+            phraseVocabularySize = other.phraseVocabularySize;
+            lastBucketKey = other.lastBucketKey;
+        }
+
+        private void advanceTo(long bucketKey) {
+            if (lastBucketKey == Long.MIN_VALUE) {
+                lastBucketKey = bucketKey;
+                return;
+            }
+            long deltaBuckets = bucketKey - lastBucketKey;
+            if (deltaBuckets <= 0 || deltaBuckets < decayIntervalBuckets) {
+                return;
+            }
+            double decay = Math.exp(-(deltaBuckets * (double) bucketSeconds) / halfLifeSeconds);
+            globalTotal *= decay;
+            if (lazyDecay) {
+                scale *= decay;
+                if (scale < 1.0e-100) {
+                    rescale();
+                }
+                lastBucketKey = bucketKey;
+                return;
+            }
+            decayIntMap(globalCounts, decay);
+            decayIntMap(templateBucketCounts, decay);
+            decayLongMap(entityEventCounts, decay);
+            decayIntMap(entityTotals, decay);
+            decayLongMap(componentEventCounts, decay);
+            decayIntMap(componentTotals, decay);
+            decayLongMap(componentLevelEventCounts, decay);
+            decayLongMap(componentLevelTotals, decay);
+            decayLongMap(templateParameterCounts, decay);
+            decayLongMap(entityParameterCounts, decay);
+            decayIntMap(parameterCounts, decay);
+            decayLongMap(semanticSignatureCounts, decay);
+            decayLongMap(semanticSignatureBucketCounts, decay);
+            decayIntMap(phraseCounts, decay);
+            decayLongMap(transitionCounts, decay);
+            decayIntMap(prevTotals, decay);
+            lastBucketKey = bucketKey;
+        }
+
+        private void update(Dataset dataset, int lineIndex, double weight) {
+            int bucketIndex = dataset.bucketIndexes.values[lineIndex];
+            long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+            advanceTo(bucketKey);
+            if (weight <= 0.0) {
+                return;
+            }
+            int eventId = dataset.eventIds.values[lineIndex];
+            int entityId = dataset.entityIds.values[lineIndex];
+            int componentId = dataset.componentIds.values[lineIndex];
+            int levelId = dataset.levelIds.values[lineIndex];
+            int parameterHash = dataset.parameterHashes.values[lineIndex];
+            int phraseHash = dataset.phraseHashes.values[lineIndex];
+            int prevEventId = dataset.prevEventIds.values[lineIndex];
+            if (!globalCounts.containsKey(eventId)) {
+                ++vocabularySize;
+            }
+            add(globalCounts, eventId, weight);
+            Long previousTemplateBucket = lastTemplateBucket.put(eventId, bucketKey);
+            if (previousTemplateBucket == null || previousTemplateBucket.longValue() != bucketKey) {
+                add(templateBucketCounts, eventId, weight);
+            }
+            long entityEventKey = entityEventKey(entityId, eventId);
+            long componentEventKey = entityEventKey(componentId, eventId);
+            long componentLevelKey = componentLevelKey(componentId, levelId);
+            add(entityEventCounts, entityEventKey, weight);
+            add(entityTotals, entityId, weight);
+            add(componentEventCounts, componentEventKey, weight);
+            add(componentTotals, componentId, weight);
+            add(componentLevelEventCounts, componentLevelEventKey(componentId, levelId, eventId), weight);
+            add(componentLevelTotals, componentLevelKey, weight);
+            if (useParameterFeatures && parameterHash != 0) {
+                if (parameterVocabularySize < PARAMETER_VOCABULARY_CAP) {
+                    if (!parameterCounts.containsKey(parameterHash)) {
+                        ++parameterVocabularySize;
+                    }
+                    add(parameterCounts, parameterHash, weight);
+                }
+                addTemplateParameter(entityEventKey(eventId, parameterHash), weight);
+                addEntityParameter(entityEventKey(entityId, parameterHash), weight);
+            }
+            if (phraseHash != 0) {
+                long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+                if (!semanticSignatureCounts.containsKey(signatureKey)) {
+                    ++semanticSignatureVocabularySize;
+                }
+                if (!phraseCounts.containsKey(phraseHash)) {
+                    ++phraseVocabularySize;
+                }
+                add(semanticSignatureCounts, signatureKey, weight);
+                add(phraseCounts, phraseHash, weight);
+                Long previousBucket = lastSemanticSignatureBucket.put(signatureKey, bucketKey);
+                if (previousBucket == null || previousBucket.longValue() != bucketKey) {
+                    add(semanticSignatureBucketCounts, signatureKey, weight);
+                }
+            }
+            add(transitionCounts, transitionKey(prevEventId, eventId), weight);
+            add(prevTotals, prevEventId, weight);
+            globalTotal += weight;
+        }
+
+        private double globalCount(int eventId) {
+            return count(globalCounts, eventId);
+        }
+
+        private double templateBucketCount(int eventId) {
+            return count(templateBucketCounts, eventId);
+        }
+
+        private double entityTotal(int entityId) {
+            return count(entityTotals, entityId);
+        }
+
+        private double componentLevelTotal(int componentId, int levelId) {
+            return count(componentLevelTotals, componentLevelKey(componentId, levelId));
+        }
+
+        private double globalProbability(int eventId) {
+            return smoothedProbability(globalCount(eventId), globalTotal, vocabularySize);
+        }
+
+        private double entityProbability(int entityId, int eventId) {
+            double total = entityTotal(entityId);
+            if (total < 1.0) {
+                return globalProbability(eventId);
+            }
+            return smoothedProbability(count(entityEventCounts, entityEventKey(entityId, eventId)), total,
+                    vocabularySize);
+        }
+
+        private double componentLevelProbability(int componentId, int levelId, int eventId) {
+            double total = componentLevelTotal(componentId, levelId);
+            if (total < 1.0) {
+                return globalProbability(eventId);
+            }
+            return smoothedProbability(
+                    count(componentLevelEventCounts, componentLevelEventKey(componentId, levelId, eventId)),
+                    total, vocabularySize);
+        }
+
+        private double globalRarity(int eventId) {
+            return -Math.log(globalProbability(eventId));
+        }
+
+        private double entityRarity(int entityId, int eventId) {
+            double total = entityTotal(entityId);
+            if (total < 10.0) {
+                return globalRarity(eventId);
+            }
+            return -Math.log(entityProbability(entityId, eventId));
+        }
+
+        private double entityGivenTemplateRarity(int entityId, int eventId) {
+            double eventTotal = globalCount(eventId);
+            if (eventTotal < 10.0) {
+                return 0.0;
+            }
+            double count = count(entityEventCounts, entityEventKey(entityId, eventId));
+            return -Math.log(smoothedProbability(count, eventTotal, max(1, entityTotals.size())));
+        }
+
+        private double componentRarity(int componentId, int eventId) {
+            double total = count(componentTotals, componentId);
+            if (total < 10.0) {
+                return globalRarity(eventId);
+            }
+            return -Math.log(smoothedProbability(
+                    count(componentEventCounts, entityEventKey(componentId, eventId)), total,
+                    vocabularySize));
+        }
+
+        private double componentLevelRarity(int componentId, int levelId, int eventId) {
+            double total = componentLevelTotal(componentId, levelId);
+            if (total < 10.0) {
+                return componentRarity(componentId, eventId);
+            }
+            return -Math.log(componentLevelProbability(componentId, levelId, eventId));
+        }
+
+        private double parameterRarity(int entityId, int eventId, int parameterHash) {
+            if (!useParameterFeatures || parameterHash == 0 || parameterVocabularySize <= 1) {
+                return 0.0;
+            }
+            double score = 0.0;
+            double templateTotal = globalCount(eventId);
+            if (templateTotal >= 20.0) {
+                double count = templateParameterCount(entityEventKey(eventId, parameterHash));
+                score += min(8.0, -Math.log(smoothedProbability(count, templateTotal,
+                        min(parameterVocabularySize, PARAMETER_VOCABULARY_CAP))));
+                if (count == 0.0) {
+                    score += 2.0;
+                }
+            }
+            double entityTotal = entityTotal(entityId);
+            if (entityTotal >= 20.0) {
+                double count = entityParameterCount(entityEventKey(entityId, parameterHash));
+                score += 0.35 * min(8.0, -Math.log(smoothedProbability(count, entityTotal,
+                        min(parameterVocabularySize, PARAMETER_VOCABULARY_CAP))));
+            }
+            return min(12.0, score);
+        }
+
+        private double semanticSignatureRarity(int componentId, int levelId, int phraseHash) {
+            if (phraseHash == 0 || semanticSignatureVocabularySize <= 1) {
+                return 0.0;
+            }
+            double total = componentLevelTotal(componentId, levelId);
+            if (total < 20.0) {
+                return phraseRarity(phraseHash);
+            }
+            double count = count(semanticSignatureCounts, semanticSignatureKey(componentId, levelId, phraseHash));
+            return -Math.log(smoothedProbability(count, total, semanticSignatureVocabularySize));
+        }
+
+        private double phraseRarity(int phraseHash) {
+            if (phraseHash == 0 || phraseVocabularySize <= 1) {
+                return 0.0;
+            }
+            return -Math.log(smoothedProbability(count(phraseCounts, phraseHash), globalTotal,
+                    phraseVocabularySize));
+        }
+
+        private double stableSignatureSuppression(int componentId, int levelId, int phraseHash, double minCount,
+                double minBuckets, double maxSuppression) {
+            if (phraseHash == 0) {
+                return 0.0;
+            }
+            long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
+            double count = count(semanticSignatureCounts, signatureKey);
+            double buckets = count(semanticSignatureBucketCounts, signatureKey);
+            if (count < minCount || buckets < minBuckets) {
+                return 0.0;
+            }
+            return min(maxSuppression, Math.log1p(count) + 0.5 * Math.log1p(buckets));
+        }
+
+        private double transitionSurprise(int prevEventId, int eventId) {
+            double prevTotal = count(prevTotals, prevEventId);
+            if (prevTotal < 10.0) {
+                return globalRarity(eventId);
+            }
+            double count = count(transitionCounts, transitionKey(prevEventId, eventId));
+            return -Math.log(smoothedProbability(count, prevTotal, vocabularySize));
+        }
+
+        private String entrySummary() {
+            return String.format(Locale.ROOT,
+                    "total=%.1f scale=%.3g maps=%d sketchParam=%s global=%d entityEvent=%d entityTotals=%d componentEvent=%d componentTotals=%d componentLevelEvent=%d componentLevelTotals=%d templateParam=%d entityParam=%d param=%d signature=%d signatureBuckets=%d phrase=%d transition=%d prevTotals=%d",
+                    globalTotal, scale, entryCount(), sketchParameterPairs ? "true" : "false", globalCounts.size(), entityEventCounts.size(), entityTotals.size(),
+                    componentEventCounts.size(), componentTotals.size(), componentLevelEventCounts.size(),
+                    componentLevelTotals.size(), templateParameterCounts.size(), entityParameterCounts.size(),
+                    parameterCounts.size(), semanticSignatureCounts.size(), semanticSignatureBucketCounts.size(),
+                    phraseCounts.size(), transitionCounts.size(), prevTotals.size());
+        }
+
+        private int entryCount() {
+            return globalCounts.size() + templateBucketCounts.size() + lastTemplateBucket.size()
+                    + entityEventCounts.size() + entityTotals.size() + componentEventCounts.size()
+                    + componentTotals.size() + componentLevelEventCounts.size() + componentLevelTotals.size()
+                    + templateParameterCounts.size() + entityParameterCounts.size() + parameterCounts.size()
+                    + semanticSignatureCounts.size() + semanticSignatureBucketCounts.size()
+                    + lastSemanticSignatureBucket.size() + phraseCounts.size() + transitionCounts.size()
+                    + prevTotals.size();
+        }
+
+        private static double smoothedProbability(double count, double total, int vocabularySize) {
+            return (count + 1.0) / (total + max(1, vocabularySize) + 1.0);
+        }
+
+        private double count(Map<Integer, Double> map, int key) {
+            double value = map.getOrDefault(key, 0.0);
+            return lazyDecay ? value * scale : value;
+        }
+
+        private double count(Map<Long, Double> map, long key) {
+            double value = map.getOrDefault(key, 0.0);
+            return lazyDecay ? value * scale : value;
+        }
+
+        private double templateParameterCount(long key) {
+            if (sketchParameterPairs) {
+                return templateParameterSketch.estimate(key) * (lazyDecay ? scale : 1.0);
+            }
+            return count(templateParameterCounts, key);
+        }
+
+        private double entityParameterCount(long key) {
+            if (sketchParameterPairs) {
+                return entityParameterSketch.estimate(key) * (lazyDecay ? scale : 1.0);
+            }
+            return count(entityParameterCounts, key);
+        }
+
+        private void add(Map<Integer, Double> map, int key, double amount) {
+            double storedAmount = lazyDecay ? amount / scale : amount;
+            map.put(key, map.getOrDefault(key, 0.0) + storedAmount);
+        }
+
+        private void add(Map<Long, Double> map, long key, double amount) {
+            double storedAmount = lazyDecay ? amount / scale : amount;
+            map.put(key, map.getOrDefault(key, 0.0) + storedAmount);
+        }
+
+        private void addTemplateParameter(long key, double amount) {
+            if (sketchParameterPairs) {
+                templateParameterSketch.add(key, lazyDecay ? amount / scale : amount);
+            } else {
+                add(templateParameterCounts, key, amount);
+            }
+        }
+
+        private void addEntityParameter(long key, double amount) {
+            if (sketchParameterPairs) {
+                entityParameterSketch.add(key, lazyDecay ? amount / scale : amount);
+            } else {
+                add(entityParameterCounts, key, amount);
+            }
+        }
+
+        private void rescale() {
+            rescaleIntMap(globalCounts);
+            rescaleIntMap(templateBucketCounts);
+            rescaleLongMap(entityEventCounts);
+            rescaleIntMap(entityTotals);
+            rescaleLongMap(componentEventCounts);
+            rescaleIntMap(componentTotals);
+            rescaleLongMap(componentLevelEventCounts);
+            rescaleLongMap(componentLevelTotals);
+            rescaleLongMap(templateParameterCounts);
+            rescaleLongMap(entityParameterCounts);
+            if (templateParameterSketch != null) {
+                templateParameterSketch.multiply(scale);
+            }
+            if (entityParameterSketch != null) {
+                entityParameterSketch.multiply(scale);
+            }
+            rescaleIntMap(parameterCounts);
+            rescaleLongMap(semanticSignatureCounts);
+            rescaleLongMap(semanticSignatureBucketCounts);
+            rescaleIntMap(phraseCounts);
+            rescaleLongMap(transitionCounts);
+            rescaleIntMap(prevTotals);
+            scale = 1.0;
+        }
+
+        private void rescaleIntMap(Map<Integer, Double> map) {
+            Iterator<Map.Entry<Integer, Double>> iterator = map.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, Double> entry = iterator.next();
+                double value = entry.getValue() * scale;
+                if (value < PRUNE_BELOW) {
+                    iterator.remove();
+                } else {
+                    entry.setValue(value);
+                }
+            }
+        }
+
+        private void rescaleLongMap(Map<Long, Double> map) {
+            Iterator<Map.Entry<Long, Double>> iterator = map.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Long, Double> entry = iterator.next();
+                double value = entry.getValue() * scale;
+                if (value < PRUNE_BELOW) {
+                    iterator.remove();
+                } else {
+                    entry.setValue(value);
+                }
+            }
+        }
+
+        private static void decayIntMap(Map<Integer, Double> map, double factor) {
+            Iterator<Map.Entry<Integer, Double>> iterator = map.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, Double> entry = iterator.next();
+                double value = entry.getValue() * factor;
+                if (value < PRUNE_BELOW) {
+                    iterator.remove();
+                } else {
+                    entry.setValue(value);
+                }
+            }
+        }
+
+        private static void decayLongMap(Map<Long, Double> map, double factor) {
+            Iterator<Map.Entry<Long, Double>> iterator = map.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Long, Double> entry = iterator.next();
+                double value = entry.getValue() * factor;
+                if (value < PRUNE_BELOW) {
+                    iterator.remove();
+                } else {
+                    entry.setValue(value);
+                }
+            }
+        }
+    }
+
+    private static final class CountMinSketchLong {
+        private static final long[] SEEDS = {
+                0x9E3779B97F4A7C15L,
+                0xC2B2AE3D27D4EB4FL,
+                0x165667B19E3779F9L,
+                0x85EBCA77C2B2AE63L,
+                0x27D4EB2F165667C5L,
+                0xD6E8FEB86659FD93L,
+                0xA5A3564E27FDCB2DL,
+                0x9FB21C651E98DF25L };
+
+        private final int depth;
+        private final int width;
+        private final double[][] counts;
+
+        private CountMinSketchLong(int depth, int width) {
+            this.depth = max(1, min(depth, SEEDS.length));
+            this.width = max(1024, width);
+            counts = new double[this.depth][this.width];
+        }
+
+        private CountMinSketchLong(CountMinSketchLong other) {
+            depth = other.depth;
+            width = other.width;
+            counts = new double[depth][width];
+            for (int i = 0; i < depth; i++) {
+                System.arraycopy(other.counts[i], 0, counts[i], 0, width);
+            }
+        }
+
+        private void add(long key, double amount) {
+            if (amount <= 0.0) {
+                return;
+            }
+            for (int i = 0; i < depth; i++) {
+                counts[i][index(key, i)] += amount;
+            }
+        }
+
+        private double estimate(long key) {
+            double result = Double.POSITIVE_INFINITY;
+            for (int i = 0; i < depth; i++) {
+                result = min(result, counts[i][index(key, i)]);
+            }
+            return Double.isFinite(result) ? result : 0.0;
+        }
+
+        private void multiply(double factor) {
+            if (factor == 1.0) {
+                return;
+            }
+            for (int i = 0; i < depth; i++) {
+                double[] row = counts[i];
+                for (int j = 0; j < row.length; j++) {
+                    row[j] *= factor;
+                }
+            }
+        }
+
+        private int index(long key, int row) {
+            long mixed = mix64(key ^ SEEDS[row]);
+            return (int) ((mixed & 0x7fffffffffffffffL) % width);
+        }
+
+        private static long mix64(long value) {
+            value ^= value >>> 33;
+            value *= 0xff51afd7ed558ccdL;
+            value ^= value >>> 33;
+            value *= 0xc4ceb9fe1a85ec53L;
+            value ^= value >>> 33;
+            return value;
+        }
+    }
+
+    private static final class DecayedScoreHistogram {
+        private final double maxScore;
+        private final double halfLifeSeconds;
+        private final int bucketSeconds;
+        private final double[] counts;
+        private double total;
+        private long lastBucketKey = Long.MIN_VALUE;
+
+        private DecayedScoreHistogram(double maxScore, int bins, double halfLifeSeconds, int bucketSeconds) {
+            this.maxScore = max(1.0, maxScore);
+            this.halfLifeSeconds = max(1.0, halfLifeSeconds);
+            this.bucketSeconds = bucketSeconds;
+            counts = new double[max(8, bins)];
+        }
+
+        private DecayedScoreHistogram(DecayedScoreHistogram other) {
+            maxScore = other.maxScore;
+            halfLifeSeconds = other.halfLifeSeconds;
+            bucketSeconds = other.bucketSeconds;
+            counts = java.util.Arrays.copyOf(other.counts, other.counts.length);
+            total = other.total;
+            lastBucketKey = other.lastBucketKey;
+        }
+
+        private void advanceTo(long bucketKey) {
+            if (lastBucketKey == Long.MIN_VALUE) {
+                lastBucketKey = bucketKey;
+                return;
+            }
+            long deltaBuckets = bucketKey - lastBucketKey;
+            if (deltaBuckets <= 0) {
+                return;
+            }
+            double decay = Math.exp(-(deltaBuckets * (double) bucketSeconds) / halfLifeSeconds);
+            for (int i = 0; i < counts.length; i++) {
+                counts[i] *= decay;
+            }
+            total *= decay;
+            lastBucketKey = bucketKey;
+        }
+
+        private void update(double score, long bucketKey) {
+            advanceTo(bucketKey);
+            int bin = bin(score);
+            counts[bin] += 1.0;
+            total += 1.0;
+        }
+
+        private double total() {
+            return total;
+        }
+
+        private double quantile(double quantile) {
+            if (total <= 0.0) {
+                return Double.POSITIVE_INFINITY;
+            }
+            double target = max(0.0, min(1.0, quantile)) * total;
+            double seen = 0.0;
+            for (int i = 0; i < counts.length; i++) {
+                seen += counts[i];
+                if (seen >= target) {
+                    return i * maxScore / (counts.length - 1.0);
+                }
+            }
+            return maxScore;
+        }
+
+        private int bin(double score) {
+            double clean = Double.isFinite(score) ? max(0.0, min(maxScore, score)) : maxScore;
+            int bin = (int) Math.floor(clean / maxScore * (counts.length - 1));
+            return min(max(bin, 0), counts.length - 1);
+        }
+    }
+
+    private static final class OnlineThresholdState {
+        private final DecayedScoreHistogram global;
+        private final Map<Long, DecayedScoreHistogram> groupHistograms = new HashMap<>();
+        private final String groupMode;
+        private final int minGroupCount;
+        private final double maxScore;
+        private final int bins;
+        private final double halfLifeSeconds;
+        private final int bucketSeconds;
+
+        private OnlineThresholdState(Config config) {
+            maxScore = config.rollingScoreMax;
+            bins = config.rollingBins;
+            halfLifeSeconds = daysToSeconds(config.onlineQuantileHalfLifeDays);
+            bucketSeconds = config.bucketSeconds;
+            groupMode = "auto".equals(config.onlineThresholdGroup) ? "global" : config.onlineThresholdGroup;
+            minGroupCount = max(1, config.onlineThresholdMinCount);
+            global = new DecayedScoreHistogram(maxScore, bins, halfLifeSeconds, bucketSeconds);
+        }
+
+        private OnlineThresholdState(OnlineThresholdState other) {
+            maxScore = other.maxScore;
+            bins = other.bins;
+            halfLifeSeconds = other.halfLifeSeconds;
+            bucketSeconds = other.bucketSeconds;
+            groupMode = other.groupMode;
+            minGroupCount = other.minGroupCount;
+            global = new DecayedScoreHistogram(other.global);
+            for (Map.Entry<Long, DecayedScoreHistogram> entry : other.groupHistograms.entrySet()) {
+                groupHistograms.put(entry.getKey(), new DecayedScoreHistogram(entry.getValue()));
+            }
+        }
+
+        private void advanceTo(long bucketKey) {
+            global.advanceTo(bucketKey);
+        }
+
+        private void update(Dataset dataset, int lineIndex, double score, long bucketKey) {
+            global.update(score, bucketKey);
+            Long groupKey = groupKey(dataset, lineIndex);
+            if (groupKey != null) {
+                groupHistogram(groupKey, true).update(score, bucketKey);
+            }
+        }
+
+        private double quantile(Dataset dataset, int lineIndex, double quantile, long bucketKey) {
+            double globalThreshold = global.quantile(quantile);
+            Long groupKey = groupKey(dataset, lineIndex);
+            if (groupKey != null) {
+                DecayedScoreHistogram histogram = groupHistogram(groupKey, false);
+                if (histogram != null) {
+                    histogram.advanceTo(bucketKey);
+                    if (histogram.total() >= minGroupCount) {
+                        return max(globalThreshold, histogram.quantile(quantile));
+                    }
+                }
+            }
+            return globalThreshold;
+        }
+
+        private DecayedScoreHistogram groupHistogram(Long groupKey, boolean create) {
+            DecayedScoreHistogram histogram = groupHistograms.get(groupKey);
+            if (histogram == null && create) {
+                histogram = new DecayedScoreHistogram(maxScore, bins, halfLifeSeconds, bucketSeconds);
+                groupHistograms.put(groupKey, histogram);
+            }
+            return histogram;
+        }
+
+        private Long groupKey(Dataset dataset, int lineIndex) {
+            if ("global".equals(groupMode)) {
+                return null;
+            }
+            int componentId = dataset.componentIds.values[lineIndex];
+            int levelId = dataset.levelIds.values[lineIndex];
+            int keyword = keywordClass(dataset.keywordScores.values[lineIndex]);
+            if ("component_level".equals(groupMode)) {
+                return componentLevelKey(componentId, levelId);
+            }
+            if ("component_keyword".equals(groupMode)) {
+                return entityEventKey(componentId, keyword);
+            }
+            if ("level_keyword".equals(groupMode)) {
+                return entityEventKey(levelId, keyword);
+            }
+            throw new IllegalArgumentException("unknown online threshold group " + groupMode);
+        }
+    }
+
+    private static final class AnchoredDynamicThresholdState {
+        private final DynamicThresholdStats global;
+        private final Map<Integer, DynamicThresholdStats> parentStats = new HashMap<>();
+        private final Map<Long, DynamicThresholdStats> leafStats = new HashMap<>();
+        private final String groupMode;
+        private final int minGroupCount;
+        private final double shrinkageK;
+        private final double zFactor;
+        private final boolean floorParentThreshold;
+        private final boolean warmupRelativeDynamic;
+        private final double halfLifeSeconds;
+        private final int bucketSeconds;
+        private boolean lastThresholdAnchorControlled = true;
+
+        private AnchoredDynamicThresholdState(Config config) {
+            groupMode = effectiveGroupMode(config);
+            minGroupCount = max(1, config.onlineThresholdMinCount);
+            shrinkageK = max(1.0, config.anchoredThresholdShrinkageK);
+            zFactor = config.zFactor;
+            floorParentThreshold = config.anchoredThresholdFloorParent;
+            warmupRelativeDynamic = config.useWarmupRelativeDynamicThreshold();
+            halfLifeSeconds = daysToSeconds(config.anchoredThresholdHalfLifeDays);
+            bucketSeconds = config.bucketSeconds;
+            global = new DynamicThresholdStats(halfLifeSeconds, bucketSeconds);
+        }
+
+        private static String effectiveGroupMode(Config config) {
+            return "auto".equals(config.onlineThresholdGroup) ? "global" : config.onlineThresholdGroup;
+        }
+
+        private static AnchoredDynamicThresholdState fromWarmup(Dataset dataset, OnlineBaselineState seed,
+                int startBucket, int endBucket, double quantile, Config config) {
+            return fromWarmup(dataset, seed, startBucket, endBucket, quantile, config, config.scoreMode, Double.NaN,
+                    false);
+        }
+
+        private static AnchoredDynamicThresholdState fromWarmup(Dataset dataset, OnlineBaselineState seed,
+                int startBucket, int endBucket, double quantile, Config config, String scoreMode,
+                double globalAnchorOverride, boolean updateSeed) {
+            AnchoredDynamicThresholdState state = new AnchoredDynamicThresholdState(config);
+            List<Double> globalScores = new ArrayList<>();
+            Map<Integer, List<Double>> parentScores = new HashMap<>();
+            Map<Long, List<Double>> leafScores = new HashMap<>();
+            OnlineThresholdState histogramAnchor = config.useHistogramAnchorQuantile(scoreMode)
+                    ? new OnlineThresholdState(config) : null;
+            for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
+                long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
+                state.advanceTo(bucketKey);
+                if (updateSeed) {
+                    seed.advanceTo(bucketKey);
+                }
+                for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
+                    double rawScore = onlineDecayedLineScore(dataset, seed, i, config, scoreMode);
+                    double score = anchoredThresholdScore(rawScore, config);
+                    globalScores.add(score);
+                    if (histogramAnchor != null) {
+                        histogramAnchor.update(dataset, i, rawScore, bucketKey);
+                    }
+                    state.global.update(score, bucketKey);
+                    Integer parentKey = state.parentKey(dataset, i);
+                    if (parentKey != null) {
+                        parentScores.computeIfAbsent(parentKey, ignored -> new ArrayList<>()).add(score);
+                        state.parent(parentKey, true).update(score, bucketKey);
+                    }
+                    Long leafKey = state.leafKey(dataset, i);
+                    if (leafKey != null) {
+                        leafScores.computeIfAbsent(leafKey, ignored -> new ArrayList<>()).add(score);
+                        state.leaf(leafKey, true).update(score, bucketKey);
+                    }
+                    if (updateSeed) {
+                        seed.update(dataset, i, 1.0, 1.0, 1.0);
+                    }
+                }
+            }
+            double globalAnchor = Double.isFinite(globalAnchorOverride) ? globalAnchorOverride
+                    : config.useHistogramAnchorQuantile(scoreMode)
+                            ? anchoredThresholdScore(histogramAnchor.global.quantile(quantile), config)
+                            : listQuantile(globalScores, quantile);
+            state.global.setWarmupAnchor(globalAnchor);
+            state.global.captureWarmupDynamic(state.zFactor);
+            for (Map.Entry<Integer, DynamicThresholdStats> entry : state.parentStats.entrySet()) {
+                List<Double> scores = parentScores.get(entry.getKey());
+                double anchor = scores != null && scores.size() >= state.minGroupCount ? listQuantile(scores, quantile)
+                        : globalAnchor;
+                entry.getValue().setWarmupAnchor(anchor);
+                entry.getValue().captureWarmupDynamic(state.zFactor);
+            }
+            for (Map.Entry<Long, DynamicThresholdStats> entry : state.leafStats.entrySet()) {
+                List<Double> scores = leafScores.get(entry.getKey());
+                Integer parentKey = state.parentKey(entry.getKey());
+                DynamicThresholdStats parent = parentKey == null ? null : state.parent(parentKey, false);
+                double parentAnchor = parent == null ? globalAnchor : parent.warmupAnchor();
+                double anchor = scores != null && scores.size() >= state.minGroupCount ? listQuantile(scores, quantile)
+                        : parentAnchor;
+                entry.getValue().setWarmupAnchor(anchor);
+                entry.getValue().captureWarmupDynamic(state.zFactor);
+            }
+            return state;
+        }
+
+        private void advanceTo(long bucketKey) {
+            global.advanceTo(bucketKey);
+        }
+
+        private void update(Dataset dataset, int lineIndex, double score, long bucketKey) {
+            global.update(score, bucketKey);
+            Integer parentKey = parentKey(dataset, lineIndex);
+            if (parentKey != null) {
+                parent(parentKey, true).update(score, bucketKey);
+            }
+            Long leafKey = leafKey(dataset, lineIndex);
+            if (leafKey != null) {
+                leaf(leafKey, true).update(score, bucketKey);
+            }
+        }
+
+        private double threshold(Dataset dataset, int lineIndex, long bucketKey) {
+            double globalThreshold = global.threshold(zFactor, bucketKey, warmupRelativeDynamic);
+            double globalAnchor = global.warmupAnchor();
+            Integer parentKey = parentKey(dataset, lineIndex);
+            if (parentKey == null) {
+                recordThresholdControl(globalThreshold, globalAnchor);
+                return globalThreshold;
+            }
+            DynamicThresholdStats parent = parent(parentKey, false);
+            double parentThreshold = globalThreshold;
+            double parentAnchorFloor = globalAnchor;
+            if (parent != null) {
+                double local = parent.threshold(zFactor, bucketKey, warmupRelativeDynamic);
+                double blended = blend(local, globalThreshold, parent.count(bucketKey));
+                if (floorParentThreshold()) {
+                    blended = max(globalThreshold, blended);
+                }
+                parentThreshold = max(parent.warmupAnchor(), blended);
+                parentAnchorFloor = parent.warmupAnchor();
+            }
+            if ("component".equals(groupMode)) {
+                recordThresholdControl(parentThreshold, parentAnchorFloor);
+                return parentThreshold;
+            }
+            Long leafKey = leafKey(dataset, lineIndex);
+            if (leafKey == null) {
+                recordThresholdControl(parentThreshold, parentAnchorFloor);
+                return parentThreshold;
+            }
+            DynamicThresholdStats leaf = leaf(leafKey, false);
+            if (leaf == null) {
+                recordThresholdControl(parentThreshold, parentAnchorFloor);
+                return parentThreshold;
+            }
+            double local = leaf.threshold(zFactor, bucketKey, warmupRelativeDynamic);
+            double blended = blend(local, parentThreshold, leaf.count(bucketKey));
+            if (floorParentThreshold()) {
+                blended = max(parentThreshold, blended);
+            }
+            double threshold = max(leaf.warmupAnchor(), blended);
+            recordThresholdControl(threshold, leaf.warmupAnchor());
+            return threshold;
+        }
+
+        private void recordThresholdControl(double threshold, double anchorFloor) {
+            lastThresholdAnchorControlled = threshold <= anchorFloor + 1.0e-12;
+        }
+
+        private boolean lastThresholdAnchorControlled() {
+            return lastThresholdAnchorControlled;
+        }
+
+        private boolean floorParentThreshold() {
+            return floorParentThreshold;
+        }
+
+        private double blend(double local, double parent, double count) {
+            if (!Double.isFinite(local)) {
+                return parent;
+            }
+            if (!Double.isFinite(parent)) {
+                return local;
+            }
+            double weight = count / (count + shrinkageK);
+            return weight * local + (1.0 - weight) * parent;
+        }
+
+        private DynamicThresholdStats parent(Integer key, boolean create) {
+            DynamicThresholdStats stats = parentStats.get(key);
+            if (stats == null && create) {
+                stats = new DynamicThresholdStats(halfLifeSeconds, bucketSeconds);
+                parentStats.put(key, stats);
+            }
+            return stats;
+        }
+
+        private DynamicThresholdStats leaf(Long key, boolean create) {
+            DynamicThresholdStats stats = leafStats.get(key);
+            if (stats == null && create) {
+                stats = new DynamicThresholdStats(halfLifeSeconds, bucketSeconds);
+                leafStats.put(key, stats);
+            }
+            return stats;
+        }
+
+        private Integer parentKey(Dataset dataset, int lineIndex) {
+            if ("global".equals(groupMode)) {
+                return null;
+            }
+            if ("level_keyword".equals(groupMode)) {
+                return dataset.levelIds.values[lineIndex];
+            }
+            return dataset.componentIds.values[lineIndex];
+        }
+
+        private Integer parentKey(long leafKey) {
+            if ("component_level".equals(groupMode) || "component_keyword".equals(groupMode)
+                    || "level_keyword".equals(groupMode)) {
+                return (int) (leafKey >> 32);
+            }
+            return null;
+        }
+
+        private Long leafKey(Dataset dataset, int lineIndex) {
+            if ("global".equals(groupMode) || "component".equals(groupMode)) {
+                return null;
+            }
+            int componentId = dataset.componentIds.values[lineIndex];
+            int levelId = dataset.levelIds.values[lineIndex];
+            int keyword = keywordClass(dataset.keywordScores.values[lineIndex]);
+            if ("component_level".equals(groupMode)) {
+                return componentLevelKey(componentId, levelId);
+            }
+            if ("component_keyword".equals(groupMode)) {
+                return entityEventKey(componentId, keyword);
+            }
+            if ("level_keyword".equals(groupMode)) {
+                return entityEventKey(levelId, keyword);
+            }
+            throw new IllegalArgumentException("unknown anchored dynamic threshold group " + groupMode);
+        }
+    }
+
+    private static final class DynamicThresholdStats {
+        private static final int MINIMUM_DEVIATION_SCORES = 10;
+
+        private final double halfLifeSeconds;
+        private final int bucketSeconds;
+        private double warmupAnchor;
+        private double warmupDynamic = Double.NaN;
+        private double total;
+        private double mean;
+        private double m2;
+        private double lowerTotal;
+        private double lowerMean;
+        private double lowerM2;
+        private long lastBucketKey = Long.MIN_VALUE;
+
+        private DynamicThresholdStats(double halfLifeSeconds, int bucketSeconds) {
+            this.halfLifeSeconds = max(1.0, halfLifeSeconds);
+            this.bucketSeconds = bucketSeconds;
+        }
+
+        private void setWarmupAnchor(double warmupAnchor) {
+            this.warmupAnchor = Double.isFinite(warmupAnchor) ? max(0.0, warmupAnchor) : 0.0;
+        }
+
+        private double warmupAnchor() {
+            return warmupAnchor;
+        }
+
+        private void captureWarmupDynamic(double zFactor) {
+            warmupDynamic = rawDynamicThreshold(zFactor);
+            if (!Double.isFinite(warmupDynamic)) {
+                warmupDynamic = warmupAnchor;
+            }
+        }
+
+        private void advanceTo(long bucketKey) {
+            if (lastBucketKey == Long.MIN_VALUE) {
+                lastBucketKey = bucketKey;
+                return;
+            }
+            long deltaBuckets = bucketKey - lastBucketKey;
+            if (deltaBuckets <= 0) {
+                return;
+            }
+            double decay = Math.exp(-(deltaBuckets * (double) bucketSeconds) / halfLifeSeconds);
+            total *= decay;
+            m2 *= decay;
+            lowerTotal *= decay;
+            lowerM2 *= decay;
+            lastBucketKey = bucketKey;
+        }
+
+        private void update(double score, long bucketKey) {
+            advanceTo(bucketKey);
+            if (!Double.isFinite(score)) {
+                return;
+            }
+            double clean = max(0.0, score);
+            if (total >= MINIMUM_DEVIATION_SCORES) {
+                double gap = mean - clean;
+                if (gap > 0.0) {
+                    updateLower(gap);
+                }
+            }
+            updatePrimary(clean);
+        }
+
+        private void updatePrimary(double value) {
+            double previousTotal = total;
+            total += 1.0;
+            if (previousTotal <= 0.0) {
+                mean = value;
+                m2 = 0.0;
+                return;
+            }
+            double delta = value - mean;
+            mean += delta / total;
+            m2 += delta * (value - mean);
+        }
+
+        private void updateLower(double value) {
+            double previousTotal = lowerTotal;
+            lowerTotal += 1.0;
+            if (previousTotal <= 0.0) {
+                lowerMean = value;
+                lowerM2 = 0.0;
+                return;
+            }
+            double delta = value - lowerMean;
+            lowerMean += delta / lowerTotal;
+            lowerM2 += delta * (value - lowerMean);
+        }
+
+        private double threshold(double zFactor, long bucketKey, boolean warmupRelativeDynamic) {
+            advanceTo(bucketKey);
+            if (total < MINIMUM_DEVIATION_SCORES) {
+                return warmupAnchor;
+            }
+            double dynamic = rawDynamicThreshold(zFactor);
+            if (warmupRelativeDynamic) {
+                double baseline = max(warmupAnchor, Double.isFinite(warmupDynamic) ? warmupDynamic : dynamic);
+                return warmupAnchor + max(0.0, dynamic - baseline);
+            }
+            return max(warmupAnchor, dynamic);
+        }
+
+        private double rawDynamicThreshold(double zFactor) {
+            double deviation = primaryDeviation();
+            double lower = lowerDeviation();
+            if (lowerTotal >= MINIMUM_DEVIATION_SCORES && lower > 0.0) {
+                deviation = min(deviation, Math.sqrt(2.0) * lower);
+            }
+            return mean + max(0.0, zFactor) * deviation;
+        }
+
+        private double count(long bucketKey) {
+            advanceTo(bucketKey);
+            return total;
+        }
+
+        private double primaryDeviation() {
+            return total <= 1.0 ? 0.0 : Math.sqrt(max(0.0, m2 / total));
+        }
+
+        private double lowerDeviation() {
+            return lowerTotal <= 1.0 ? 0.0 : Math.sqrt(max(0.0, lowerM2 / lowerTotal));
+        }
+    }
+
+    private static double daysToSeconds(double days) {
+        return max(1.0, days * 24.0 * 60.0 * 60.0);
+    }
+
+    private static double hoursToSeconds(double hours) {
+        return max(1.0, hours * 60.0 * 60.0);
+    }
+
     private static long entityEventKey(int entityId, int eventId) {
         return ((long) entityId << 32) ^ (eventId & 0xffffffffL);
     }
 
     private static long componentLevelKey(int componentId, int levelId) {
         return ((long) componentId << 32) ^ (levelId & 0xffffffffL);
+    }
+
+    private static long componentLevelEventKey(int componentId, int levelId, int eventId) {
+        long key = 1469598103934665603L;
+        key = (key ^ componentId) * 1099511628211L;
+        key = (key ^ levelId) * 1099511628211L;
+        key = (key ^ eventId) * 1099511628211L;
+        return key;
     }
 
     private static long semanticSignatureKey(int componentId, int levelId, int phraseHash) {
@@ -2664,7 +4911,15 @@ public final class LineLevelLogAnomalyBenchmark {
         return hash & 0x7fffffff;
     }
 
-    private static final class SimpleDrainParser {
+    private interface TemplateParser {
+        int parse(String message);
+
+        int templateCount();
+
+        String[] templates();
+    }
+
+    private static final class SimpleDrainParser implements TemplateParser {
         private final double similarityThreshold;
         private final Map<Integer, List<DrainCluster>> clustersByLength = new HashMap<>();
         private int nextId;
@@ -2673,7 +4928,8 @@ public final class LineLevelLogAnomalyBenchmark {
             this.similarityThreshold = similarityThreshold;
         }
 
-        private int parse(String message) {
+        @Override
+        public int parse(String message) {
             List<String> tokens = tokenize(message);
             List<DrainCluster> candidates = clustersByLength.get(tokens.size());
             DrainCluster best = null;
@@ -2696,11 +4952,13 @@ public final class LineLevelLogAnomalyBenchmark {
             return cluster.id;
         }
 
-        private int templateCount() {
+        @Override
+        public int templateCount() {
             return nextId;
         }
 
-        private String[] templates() {
+        @Override
+        public String[] templates() {
             String[] result = new String[nextId];
             for (List<DrainCluster> clusters : clustersByLength.values()) {
                 for (DrainCluster cluster : clusters) {
@@ -2776,6 +5034,119 @@ public final class LineLevelLogAnomalyBenchmark {
                 }
             }
         }
+    }
+
+    private static final class FixedDepthDrainParser implements TemplateParser {
+        private final double similarityThreshold;
+        private final int maxDepth;
+        private final int maxChildren;
+        private final DrainNode root = new DrainNode();
+        private int nextId;
+
+        private FixedDepthDrainParser(double similarityThreshold, int maxDepth, int maxChildren) {
+            this.similarityThreshold = similarityThreshold;
+            this.maxDepth = max(3, maxDepth);
+            this.maxChildren = max(2, maxChildren);
+        }
+
+        @Override
+        public int parse(String message) {
+            List<String> tokens = SimpleDrainParser.tokenize(message);
+            DrainNode leaf = findLeaf(tokens, false);
+            DrainCluster best = bestCluster(leaf.clusters, tokens);
+            if (best != null && SimpleDrainParser.similarity(tokens, best.template) >= similarityThreshold) {
+                SimpleDrainParser.updateTemplate(best.template, tokens);
+                return best.id;
+            }
+            DrainCluster cluster = new DrainCluster(nextId++, tokens);
+            findLeaf(tokens, true).clusters.add(cluster);
+            return cluster.id;
+        }
+
+        @Override
+        public int templateCount() {
+            return nextId;
+        }
+
+        @Override
+        public String[] templates() {
+            String[] result = new String[nextId];
+            collectTemplates(root, result);
+            for (int i = 0; i < result.length; i++) {
+                if (result[i] == null) {
+                    result[i] = "<unknown>";
+                }
+            }
+            return result;
+        }
+
+        private DrainNode findLeaf(List<String> tokens, boolean create) {
+            DrainNode node = child(root, Integer.toString(tokens.size()), create);
+            if (node == null) {
+                return root;
+            }
+            int tokenDepth = min(tokens.size(), maxDepth - 2);
+            for (int i = 0; i < tokenDepth; i++) {
+                String token = tokens.get(i);
+                DrainNode next = node.children.get(token);
+                if (next == null) {
+                    next = node.children.get("<*>");
+                }
+                if (next == null) {
+                    if (!create) {
+                        return node;
+                    }
+                    next = child(node, token, true);
+                }
+                node = next;
+            }
+            return node;
+        }
+
+        private DrainNode child(DrainNode node, String token, boolean create) {
+            DrainNode existing = node.children.get(token);
+            if (existing != null || !create) {
+                return existing;
+            }
+            String key = token;
+            if (!"<*>".equals(token) && node.children.size() >= maxChildren) {
+                key = "<*>";
+                existing = node.children.get(key);
+                if (existing != null) {
+                    return existing;
+                }
+            }
+            DrainNode created = new DrainNode();
+            node.children.put(key, created);
+            return created;
+        }
+
+        private static DrainCluster bestCluster(List<DrainCluster> candidates, List<String> tokens) {
+            DrainCluster best = null;
+            double bestSimilarity = -1.0;
+            for (DrainCluster candidate : candidates) {
+                double similarity = SimpleDrainParser.similarity(tokens, candidate.template);
+                if (similarity > bestSimilarity) {
+                    bestSimilarity = similarity;
+                    best = candidate;
+                }
+            }
+            return best;
+        }
+
+        private static void collectTemplates(DrainNode node, String[] result) {
+            for (DrainCluster cluster : node.clusters) {
+                result[cluster.id] = String.join(" ", cluster.template);
+            }
+            for (DrainNode child : node.children.values()) {
+                collectTemplates(child, result);
+            }
+        }
+    }
+
+    private static final class DrainNode {
+        private final Map<String, DrainNode> children = new HashMap<>();
+        private final List<DrainCluster> clusters = new ArrayList<>();
     }
 
     private static final class DrainCluster {
@@ -3156,6 +5527,60 @@ public final class LineLevelLogAnomalyBenchmark {
             double p = precision();
             double r = recall();
             return p + r == 0 ? 0.0 : 2.0 * p * r / (p + r);
+        }
+    }
+
+    private static final class PredictionRecord {
+        private final String datasetName;
+        private final double quantile;
+        private final double threshold;
+        private final int lineIndex;
+        private final int bucketIndex;
+        private final long bucketKey;
+        private final int entityId;
+        private final int componentId;
+        private final int levelId;
+        private final int eventId;
+        private final double score;
+        private final boolean prediction;
+        private final boolean label;
+        private final Dataset dataset;
+
+        private PredictionRecord(String datasetName, double quantile, double threshold, int lineIndex, int bucketIndex,
+                long bucketKey, int entityId, int componentId, int levelId, int eventId, double score,
+                boolean prediction, boolean label, Dataset dataset) {
+            this.datasetName = datasetName;
+            this.quantile = quantile;
+            this.threshold = threshold;
+            this.lineIndex = lineIndex;
+            this.bucketIndex = bucketIndex;
+            this.bucketKey = bucketKey;
+            this.entityId = entityId;
+            this.componentId = componentId;
+            this.levelId = levelId;
+            this.eventId = eventId;
+            this.score = score;
+            this.prediction = prediction;
+            this.label = label;
+            this.dataset = dataset;
+        }
+
+        private static String header() {
+            return "dataset,quantile,threshold,line_index,bucket_index,bucket_key,entity,component,level,template_id,score,prediction,label,template,message";
+        }
+
+        private String toCsv() {
+            String message = dataset.lineMessages.size() == dataset.labels.size ? dataset.lineMessages.get(lineIndex)
+                    : "";
+            String template = eventId >= 0 && eventId < dataset.templateTexts.length ? dataset.templateTexts[eventId]
+                    : "<unknown>";
+            return String.format(Locale.ROOT,
+                    "%s,%.5f,%.8f,%d,%d,%d,%s,%s,%s,%d,%.8f,%s,%s,%s,%s",
+                    csv(datasetName), quantile, threshold, lineIndex, bucketIndex, bucketKey,
+                    csv(nameForId(dataset.entityNames, entityId)), csv(nameForId(dataset.componentNames, componentId)),
+                    csv(nameForId(dataset.levelNames, levelId)), eventId, score,
+                    prediction ? "anomaly" : "not_anomaly", label ? "anomaly" : "not_anomaly", csv(template),
+                    csv(message));
         }
     }
 
@@ -3604,7 +6029,10 @@ public final class LineLevelLogAnomalyBenchmark {
         private final double validationFraction;
         private final int topK;
         private final int rareEventMaxTrainCount;
+        private final String parserMode;
         private final double drainSimilarity;
+        private final int drainDepth;
+        private final int drainMaxChildren;
         private final int numberOfTrees;
         private final int sampleSize;
         private final int outputAfter;
@@ -3633,17 +6061,62 @@ public final class LineLevelLogAnomalyBenchmark {
         private final int diagnosticSamples;
         private final List<QuantilePair> seedExpandPairs;
         private final double diagnosticQuantile;
+        private final double predictionFraction;
+        private final double onlineTemplateHalfLifeDays;
+        private final double onlineStableHalfLifeDays;
+        private final double onlineFastHalfLifeHours;
+        private final double onlineQuantileHalfLifeDays;
+        private final double onlineAlertUpdateWeight;
+        private final boolean onlineWinsorizeThresholdUpdates;
+        private final double onlineWinsorizeScoreMargin;
+        private final int onlineDecayIntervalBuckets;
+        private final double onlineKeywordGateQuantile;
+        private final boolean onlineStrictThreshold;
+        private final String onlineThresholdGroup;
+        private final int onlineThresholdMinCount;
+        private final boolean onlineUpdateCounts;
+        private final boolean onlineUpdateThresholds;
+        private final double onlineUpdateGuardQuantile;
+        private final double onlineTiebreakWeight;
+        private final boolean onlineLazyDecay;
+        private final boolean onlineCountSketchParameters;
+        private final int onlineCountSketchDepth;
+        private final int onlineCountSketchWidth;
+        private final double anchoredThresholdHalfLifeDays;
+        private final double anchoredThresholdShrinkageK;
+        private final boolean anchoredLogScores;
+        private final boolean anchoredThresholdFloorParent;
+        private final String anchoredThresholdDynamicMode;
+        private final String anchorSelect;
+        private final double anchorMinQuantile;
+        private final double anchorMaxQuantile;
+        private final int anchorSignatureCap;
+        private final double anchorCalibrationFraction;
+        private final boolean profileOnline;
+        private final int profileMaxEvalBuckets;
 
         private Config(List<String> datasets, String bglPath, String thunderbirdPath, String output, int bucketSeconds,
                 int bglSampleModulo, int thunderbirdSampleModulo, double trainFraction, double validationFraction,
-                int topK, int rareEventMaxTrainCount, double drainSimilarity, int numberOfTrees, int sampleSize,
-                int outputAfter, double zFactor, long seed, int progressInterval, int top, boolean includeUngated,
-                List<Double> contextAnomalyRates, String thresholdMode, List<Double> fdrQValues, String statsPeriod,
-                String scoreMode, int rollingHorizonBuckets, int rollingBins, double rollingScoreMax,
-                boolean excludeAlertUpdates, int expandBuckets, int tailBlockBuckets, int tailMinSelected,
-                double tailSignificance, boolean parameterFeatures, boolean entityBucketCounts,
-                double diagnosticRecallTarget, int diagnosticTopTemplates, int diagnosticSamples,
-                List<QuantilePair> seedExpandPairs, double diagnosticQuantile) {
+                int topK, int rareEventMaxTrainCount, String parserMode, double drainSimilarity, int drainDepth,
+                int drainMaxChildren, int numberOfTrees, int sampleSize, int outputAfter, double zFactor, long seed,
+                int progressInterval, int top, boolean includeUngated, List<Double> contextAnomalyRates,
+                String thresholdMode, List<Double> fdrQValues, String statsPeriod, String scoreMode,
+                int rollingHorizonBuckets, int rollingBins, double rollingScoreMax, boolean excludeAlertUpdates,
+                int expandBuckets, int tailBlockBuckets, int tailMinSelected, double tailSignificance,
+                boolean parameterFeatures, boolean entityBucketCounts, double diagnosticRecallTarget,
+                int diagnosticTopTemplates, int diagnosticSamples, List<QuantilePair> seedExpandPairs,
+                double diagnosticQuantile, double predictionFraction, double onlineTemplateHalfLifeDays,
+                double onlineStableHalfLifeDays, double onlineFastHalfLifeHours, double onlineQuantileHalfLifeDays,
+                double onlineAlertUpdateWeight, boolean onlineWinsorizeThresholdUpdates,
+                double onlineWinsorizeScoreMargin, int onlineDecayIntervalBuckets, double onlineKeywordGateQuantile,
+                boolean onlineStrictThreshold, String onlineThresholdGroup, int onlineThresholdMinCount,
+                boolean onlineUpdateCounts, boolean onlineUpdateThresholds, double onlineUpdateGuardQuantile,
+                double onlineTiebreakWeight, boolean onlineLazyDecay, boolean onlineCountSketchParameters,
+                int onlineCountSketchDepth, int onlineCountSketchWidth, double anchoredThresholdHalfLifeDays,
+                double anchoredThresholdShrinkageK, boolean anchoredLogScores, boolean anchoredThresholdFloorParent,
+                String anchoredThresholdDynamicMode, String anchorSelect, double anchorMinQuantile,
+                double anchorMaxQuantile, int anchorSignatureCap, double anchorCalibrationFraction,
+                boolean profileOnline, int profileMaxEvalBuckets) {
             this.datasets = datasets;
             this.bglPath = bglPath;
             this.thunderbirdPath = thunderbirdPath;
@@ -3655,7 +6128,10 @@ public final class LineLevelLogAnomalyBenchmark {
             this.validationFraction = validationFraction;
             this.topK = topK;
             this.rareEventMaxTrainCount = rareEventMaxTrainCount;
+            this.parserMode = parserMode;
             this.drainSimilarity = drainSimilarity;
+            this.drainDepth = drainDepth;
+            this.drainMaxChildren = drainMaxChildren;
             this.numberOfTrees = numberOfTrees;
             this.sampleSize = sampleSize;
             this.outputAfter = outputAfter;
@@ -3684,6 +6160,39 @@ public final class LineLevelLogAnomalyBenchmark {
             this.diagnosticSamples = diagnosticSamples;
             this.seedExpandPairs = seedExpandPairs;
             this.diagnosticQuantile = diagnosticQuantile;
+            this.predictionFraction = predictionFraction;
+            this.onlineTemplateHalfLifeDays = onlineTemplateHalfLifeDays;
+            this.onlineStableHalfLifeDays = onlineStableHalfLifeDays;
+            this.onlineFastHalfLifeHours = onlineFastHalfLifeHours;
+            this.onlineQuantileHalfLifeDays = onlineQuantileHalfLifeDays;
+            this.onlineAlertUpdateWeight = onlineAlertUpdateWeight;
+            this.onlineWinsorizeThresholdUpdates = onlineWinsorizeThresholdUpdates;
+            this.onlineWinsorizeScoreMargin = onlineWinsorizeScoreMargin;
+            this.onlineDecayIntervalBuckets = onlineDecayIntervalBuckets;
+            this.onlineKeywordGateQuantile = onlineKeywordGateQuantile;
+            this.onlineStrictThreshold = onlineStrictThreshold;
+            this.onlineThresholdGroup = onlineThresholdGroup;
+            this.onlineThresholdMinCount = onlineThresholdMinCount;
+            this.onlineUpdateCounts = onlineUpdateCounts;
+            this.onlineUpdateThresholds = onlineUpdateThresholds;
+            this.onlineUpdateGuardQuantile = onlineUpdateGuardQuantile;
+            this.onlineTiebreakWeight = onlineTiebreakWeight;
+            this.onlineLazyDecay = onlineLazyDecay;
+            this.onlineCountSketchParameters = onlineCountSketchParameters;
+            this.onlineCountSketchDepth = onlineCountSketchDepth;
+            this.onlineCountSketchWidth = onlineCountSketchWidth;
+            this.anchoredThresholdHalfLifeDays = anchoredThresholdHalfLifeDays;
+            this.anchoredThresholdShrinkageK = anchoredThresholdShrinkageK;
+            this.anchoredLogScores = anchoredLogScores;
+            this.anchoredThresholdFloorParent = anchoredThresholdFloorParent;
+            this.anchoredThresholdDynamicMode = anchoredThresholdDynamicMode;
+            this.anchorSelect = anchorSelect;
+            this.anchorMinQuantile = anchorMinQuantile;
+            this.anchorMaxQuantile = anchorMaxQuantile;
+            this.anchorSignatureCap = anchorSignatureCap;
+            this.anchorCalibrationFraction = anchorCalibrationFraction;
+            this.profileOnline = profileOnline;
+            this.profileMaxEvalBuckets = profileMaxEvalBuckets;
         }
 
         private static Config parse(String[] args) {
@@ -3696,6 +6205,18 @@ public final class LineLevelLogAnomalyBenchmark {
                 values.put(arg.substring(2), args[++i]);
             }
             String root = values.getOrDefault("data-root", "/tmp/loghub_data");
+            String trainFractionValue = values.getOrDefault("warmup-fraction",
+                    values.getOrDefault("train-fraction", "0.10"));
+            String predictionFractionValue = values.getOrDefault("score-fraction",
+                    values.getOrDefault("prediction-fraction", "0.01"));
+            String thresholdModeValue = values.getOrDefault("threshold-mode", "supervised").toLowerCase(Locale.ROOT);
+            String scoreModeValue = values.getOrDefault("score-mode", "combined").toLowerCase(Locale.ROOT);
+            String fdrDefault = "online".equals(thresholdModeValue)
+                    || "anchored-dynamic".equals(thresholdModeValue)
+                    || "anchored_dynamic".equals(thresholdModeValue)
+                    || "anchored-online".equals(thresholdModeValue)
+                    || "anchored_online".equals(thresholdModeValue) ? "0.995,0.997,0.999"
+                    : "0.20,0.30,0.40,0.50,0.60";
             return new Config(split(values.getOrDefault("datasets", "bgl,thunderbird")),
                     values.getOrDefault("bgl", root + "/BGL/BGL.log"),
                     values.getOrDefault("thunderbird", root + "/Thunderbird/Thunderbird.log"),
@@ -3703,11 +6224,14 @@ public final class LineLevelLogAnomalyBenchmark {
                     Integer.parseInt(values.getOrDefault("bucket-seconds", "600")),
                     Integer.parseInt(values.getOrDefault("bgl-sample-modulo", "1")),
                     Integer.parseInt(values.getOrDefault("thunderbird-sample-modulo", "10")),
-                    Double.parseDouble(values.getOrDefault("train-fraction", "0.10")),
+                    Double.parseDouble(trainFractionValue),
                     Double.parseDouble(values.getOrDefault("validation-fraction", "0.10")),
                     Integer.parseInt(values.getOrDefault("top-k", "25")),
                     Integer.parseInt(values.getOrDefault("rare-max-train-count", "5")),
+                    values.getOrDefault("parser", "simple").toLowerCase(Locale.ROOT),
                     Double.parseDouble(values.getOrDefault("drain-similarity", "0.5")),
+                    Integer.parseInt(values.getOrDefault("drain-depth", "4")),
+                    Integer.parseInt(values.getOrDefault("drain-max-children", "100")),
                     Integer.parseInt(values.getOrDefault("trees", "100")),
                     Integer.parseInt(values.getOrDefault("sample-size", "256")),
                     Integer.parseInt(values.getOrDefault("output-after", "32")),
@@ -3717,10 +6241,10 @@ public final class LineLevelLogAnomalyBenchmark {
                     Integer.parseInt(values.getOrDefault("top", "20")),
                     Boolean.parseBoolean(values.getOrDefault("include-ungated", "true")),
                     splitDoubles(values.getOrDefault("context-anomaly-rates", "0.02,0.05,0.10,0.20")),
-                    values.getOrDefault("threshold-mode", "supervised").toLowerCase(Locale.ROOT),
-                    splitDoubles(values.getOrDefault("fdr-q", "0.20,0.30,0.40,0.50,0.60")),
+                    thresholdModeValue,
+                    splitDoubles(values.getOrDefault("fdr-q", fdrDefault)),
                     values.getOrDefault("stats-period", "train").toLowerCase(Locale.ROOT),
-                    values.getOrDefault("score-mode", "combined").toLowerCase(Locale.ROOT),
+                    scoreModeValue,
                     Integer.parseInt(values.getOrDefault("rolling-horizon-buckets", "144")),
                     Integer.parseInt(values.getOrDefault("rolling-bins", "4096")),
                     Double.parseDouble(values.getOrDefault("rolling-score-max", "80.0")),
@@ -3735,12 +6259,72 @@ public final class LineLevelLogAnomalyBenchmark {
                     Integer.parseInt(values.getOrDefault("diagnostic-top-templates", values.getOrDefault("top", "20"))),
                     Integer.parseInt(values.getOrDefault("diagnostic-samples", "3")),
                     splitQuantilePairs(values.getOrDefault("seed-expand-pairs", "0.999:0.99,0.999:0.995,0.9995:0.995")),
-                    Double.parseDouble(values.getOrDefault("diagnostic-quantile", "NaN")));
+                    Double.parseDouble(values.getOrDefault("diagnostic-quantile", "NaN")),
+                    Double.parseDouble(predictionFractionValue),
+                    Double.parseDouble(values.getOrDefault("online-template-half-life-days", "7.0")),
+                    Double.parseDouble(values.getOrDefault("online-stable-half-life-days", "30.0")),
+                    Double.parseDouble(values.getOrDefault("online-fast-half-life-hours", "6.0")),
+                    Double.parseDouble(values.getOrDefault("online-quantile-half-life-days", "1.0")),
+                    Double.parseDouble(values.getOrDefault("online-alert-update-weight", "0.05")),
+                    Boolean.parseBoolean(values.getOrDefault("online-winsorize-threshold-updates", "true")),
+                    Double.parseDouble(values.getOrDefault("online-winsorize-score-margin", "5.0")),
+                    Integer.parseInt(values.getOrDefault("online-decay-interval-buckets", "12")),
+                    Double.parseDouble(values.getOrDefault("online-keyword-gate-quantile", "0.90")),
+                    Boolean.parseBoolean(values.getOrDefault("online-strict-threshold", "false")),
+                    values.getOrDefault("online-threshold-group", "global").toLowerCase(Locale.ROOT),
+                    Integer.parseInt(values.getOrDefault("online-threshold-min-count", "200")),
+                    Boolean.parseBoolean(values.getOrDefault("online-update-counts", "true")),
+                    Boolean.parseBoolean(values.getOrDefault("online-update-thresholds", "true")),
+                    Double.parseDouble(values.getOrDefault("online-update-guard-q", "NaN")),
+                    Double.parseDouble(values.getOrDefault("online-tiebreak-weight", "0.001")),
+                    Boolean.parseBoolean(values.getOrDefault("online-lazy-decay", "true")),
+                    Boolean.parseBoolean(values.getOrDefault("online-count-sketch-parameters", "true")),
+                    Integer.parseInt(values.getOrDefault("online-count-sketch-depth", "4")),
+                    Integer.parseInt(values.getOrDefault("online-count-sketch-width", "524288")),
+                    Double.parseDouble(values.getOrDefault("anchored-threshold-half-life-days", "7.0")),
+                    Double.parseDouble(values.getOrDefault("anchored-threshold-shrinkage-k", "1000")),
+                    Boolean.parseBoolean(values.getOrDefault("anchored-log-scores", "true")),
+                    Boolean.parseBoolean(values.getOrDefault("anchored-threshold-floor-parent", "true")),
+                    values.getOrDefault("anchored-threshold-dynamic",
+                            values.getOrDefault("anchored-dynamic-mode", "relative")).toLowerCase(Locale.ROOT),
+                    values.getOrDefault("anchor-select", "auto").toLowerCase(Locale.ROOT),
+                    Double.parseDouble(values.getOrDefault("anchor-min-quantile", "0.980")),
+                    Double.parseDouble(values.getOrDefault("anchor-max-quantile", "0.9995")),
+                    Integer.parseInt(values.getOrDefault("anchor-signature-cap", "200")),
+                    Double.parseDouble(values.getOrDefault("anchor-calibration-fraction", "1.0")),
+                    Boolean.parseBoolean(values.getOrDefault("profile-online", "false")),
+                    Integer.parseInt(values.getOrDefault("profile-max-eval-buckets", "0")));
         }
 
         private boolean useParameterFeatures() {
-            return parameterFeatures || scoreMode.contains("param") || scoreMode.contains("tiebreak")
+            return parameterFeatures || "auto".equals(scoreMode) || scoreMode.contains("param") || scoreMode.contains("tiebreak")
                     || scoreMode.startsWith("bgl_") || useSemanticFeatures();
+        }
+
+        private boolean useFixedAnchorQuantile() {
+            return "fixed".equals(anchorSelect) || "quantile".equals(anchorSelect);
+        }
+
+        private boolean useHistogramAnchorQuantile() {
+            return "histogram".equals(anchorSelect) || "histogram-quantile".equals(anchorSelect)
+                    || "histogram_quantile".equals(anchorSelect);
+        }
+
+        private boolean useHistogramAnchorQuantile(String scoreMode) {
+            return useHistogramAnchorQuantile()
+                    || ("auto".equals(anchorSelect) && scoreMode.startsWith("global_"));
+        }
+
+        private double fixedAnchorQuantile() {
+            double quantile = fdrQValues.isEmpty() ? 0.995 : fdrQValues.get(0);
+            return max(anchorMinQuantile, min(anchorMaxQuantile, quantile));
+        }
+
+        private boolean useWarmupRelativeDynamicThreshold() {
+            return "relative".equals(anchoredThresholdDynamicMode)
+                    || "warmup-relative".equals(anchoredThresholdDynamicMode)
+                    || "warmup_relative".equals(anchoredThresholdDynamicMode)
+                    || "shift".equals(anchoredThresholdDynamicMode);
         }
 
         private boolean useEntityBucketCounts() {
@@ -3752,8 +6336,12 @@ public final class LineLevelLogAnomalyBenchmark {
             return scoreMode.contains("semantic");
         }
 
+        private boolean useFixedDepthDrainParser() {
+            return "drain".equals(parserMode) || "fixed-drain".equals(parserMode) || "tree-drain".equals(parserMode);
+        }
+
         private boolean storeLineMessages() {
-            return "diagnostic".equals(thresholdMode);
+            return "diagnostic".equals(thresholdMode) || "predict".equals(thresholdMode);
         }
 
         private static List<String> split(String csv) {
