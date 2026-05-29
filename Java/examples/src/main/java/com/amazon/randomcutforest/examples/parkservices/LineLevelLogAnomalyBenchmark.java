@@ -414,7 +414,8 @@ public final class LineLevelLogAnomalyBenchmark {
                     warmupEnd, selection.anchorQuantile, config, selection.scoreMode, selection.anchorThreshold, false);
             printOnlinePhase(datasetName, "seed_thresholds", phaseStart, config);
             phaseStart = System.nanoTime();
-            OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+            OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config,
+                    selection.scoreMode);
             printOnlinePhase(datasetName, "seed_eval_baseline", phaseStart, config);
             FdrResult result = evaluateAnchoredDynamic(datasetName, dataset, online, thresholds,
                     selection.anchorQuantile, warmupEnd, dataset.buckets.size(), dataset.countLines(0, warmupEnd),
@@ -443,7 +444,8 @@ public final class LineLevelLogAnomalyBenchmark {
                 selection.anchorThreshold, true);
         printOnlinePhase(datasetName, "seed_thresholds", phaseStart, config);
         phaseStart = System.nanoTime();
-        OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config);
+        OnlineBaselineState online = OnlineBaselineState.fromWarmup(dataset, 0, warmupEnd, config,
+                selection.scoreMode);
         printOnlinePhase(datasetName, "seed_eval_baseline", phaseStart, config);
         FdrResult result = evaluateAnchoredDynamic(datasetName, dataset, online, thresholds, selection.anchorQuantile,
                 warmupEnd, dataset.buckets.size(), dataset.countLines(countWarmupEnd, warmupEnd), config,
@@ -672,9 +674,10 @@ public final class LineLevelLogAnomalyBenchmark {
                     AnchoredDynamicThresholdState.effectiveGroupMode(config), diagnostic.quantile,
                     diagnostic.threshold, diagnostic.quality, diagnostic);
             System.out.printf(Locale.ROOT,
-                    "anchored_online_candidate dataset=%s score_mode=%s anchor_q=%.6f anchor=%.8f quality=%.6f knee=%.6f stability=%.6f concentration=%.6f tail_count=%d%n",
+                    "anchored_online_candidate dataset=%s score_mode=%s anchor_q=%.6f anchor=%.8f quality=%.6f knee=%.6f deployed_knee=%.6f stability=%.6f concentration=%.6f tail_count=%d%n",
                     datasetName, scoreMode, diagnostic.quantile, diagnostic.threshold, diagnostic.quality,
-                    diagnostic.kneeStrength, diagnostic.stability, diagnostic.concentration, diagnostic.tailCount);
+                    diagnostic.kneeStrength, diagnostic.deployedKneeStrength, diagnostic.stability,
+                    diagnostic.concentration, diagnostic.tailCount);
             if (best == null || selection.quality > best.quality) {
                 best = selection;
             }
@@ -695,8 +698,13 @@ public final class LineLevelLogAnomalyBenchmark {
             result.add(config.scoreMode);
             return result;
         }
-        result.add("global_rarity_keyword_tiebreak");
-        result.add("component_rarity_keyword_stable_tiebreak");
+        if (config.useCompactOnlineState()) {
+            result.add("global_rarity_keyword");
+            result.add("component_rarity_keyword_stable");
+        } else {
+            result.add("global_rarity_keyword_tiebreak");
+            result.add("component_rarity_keyword_stable_tiebreak");
+        }
         return result;
     }
 
@@ -732,7 +740,7 @@ public final class LineLevelLogAnomalyBenchmark {
             }
         }
         if (allScores.isEmpty()) {
-            return new TailKneeDiagnostic(0.995, 0.0, 0.0, 0.0, 1.0, 0, 0.0);
+            return new TailKneeDiagnostic(0.995, 0.0, 0.0, 0.0, 0.0, 1.0, 0, 0.0);
         }
         Collections.sort(allScores);
         Collections.sort(cappedScores);
@@ -759,7 +767,8 @@ public final class LineLevelLogAnomalyBenchmark {
         }
         double threshold = selectionScores.get(bestIndex);
         double quantile = actualQuantile(allScores, threshold);
-        if (config.useFixedAnchorQuantile() || config.useHistogramAnchorQuantile(scoreMode)) {
+        boolean policyAnchor = config.useFixedAnchorQuantile() || config.useHistogramAnchorQuantile(scoreMode);
+        if (policyAnchor) {
             quantile = config.fixedAnchorQuantile();
             threshold = config.useHistogramAnchorQuantile(scoreMode)
                     ? anchoredThresholdScore(histogramAnchor.global.quantile(quantile), config)
@@ -775,15 +784,22 @@ public final class LineLevelLogAnomalyBenchmark {
         double stability = tailStability(dataset, base, startBucket, endBucket, scoreMode, quantile, threshold,
                 config);
         double kneeStrength = bestGap / max(1.0e-6, tailScale);
+        double deployedKneeStrength = policyAnchor ? localKneeStrength(allScores, threshold, tailScale, config)
+                : kneeStrength;
         double usefulTail = 1.0 / (1.0 + Math.abs(Math.log(max(1.0e-6, 1.0 - quantile) / 0.01)));
         double quality = kneeStrength + stability + 0.25 * usefulTail - 0.75 * concentration + 0.10 * bestSupport;
-        return new TailKneeDiagnostic(quantile, threshold, kneeStrength, stability, concentration, tailCount, quality);
+        return new TailKneeDiagnostic(quantile, threshold, kneeStrength, deployedKneeStrength, stability,
+                concentration, tailCount, quality);
     }
 
     private static double scoreFamilyMaxAnchorQuantile(String scoreMode, Config config) {
         if (config.useFixedAnchorQuantile()) {
             return config.anchorMaxQuantile;
         }
+        // Policy prior: component/stable score families are meant to suppress stable scary
+        // templates, so they may use a broader p98-style operating point. Global score
+        // families stay conservative by default because tied template scores can otherwise
+        // admit high-volume normal families.
         if (scoreMode.startsWith("component_")) {
             return config.anchorMinQuantile;
         }
@@ -813,6 +829,20 @@ public final class LineLevelLogAnomalyBenchmark {
         return max(1.0e-6, gaps.get(gaps.size() / 2));
     }
 
+    private static double localKneeStrength(List<Double> sortedScores, double threshold, double tailScale,
+            Config config) {
+        if (sortedScores.size() <= 1) {
+            return 0.0;
+        }
+        int boundary = config.onlineStrictThreshold ? upperBound(sortedScores, threshold)
+                : lowerBound(sortedScores, threshold);
+        if (boundary <= 0 || boundary >= sortedScores.size()) {
+            return 0.0;
+        }
+        double gap = max(0.0, sortedScores.get(boundary) - sortedScores.get(boundary - 1));
+        return gap / max(1.0e-6, tailScale);
+    }
+
     private static double actualQuantile(List<Double> sortedScores, double threshold) {
         int index = upperBound(sortedScores, threshold);
         return index / (double) sortedScores.size();
@@ -836,7 +866,7 @@ public final class LineLevelLogAnomalyBenchmark {
             for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
                 double score = anchoredThresholdScore(onlineDecayedLineScore(dataset, online, i, config, scoreMode),
                         config);
-                if (score >= threshold) {
+                if (onlinePrediction(score, threshold, config)) {
                     ++count;
                 }
                 online.update(dataset, i, 1.0, 1.0, 1.0);
@@ -855,7 +885,7 @@ public final class LineLevelLogAnomalyBenchmark {
             for (int i = dataset.lineStarts[bucketIndex]; i < dataset.lineStarts[bucketIndex + 1]; i++) {
                 double score = anchoredThresholdScore(onlineDecayedLineScore(dataset, online, i, config, scoreMode),
                         config);
-                if (score >= threshold) {
+                if (onlinePrediction(score, threshold, config)) {
                     long key = thresholdSelectionSignature(dataset, i);
                     counts.put(key, counts.getOrDefault(key, 0) + 1);
                 }
@@ -938,16 +968,18 @@ public final class LineLevelLogAnomalyBenchmark {
         private final double quantile;
         private final double threshold;
         private final double kneeStrength;
+        private final double deployedKneeStrength;
         private final double stability;
         private final double concentration;
         private final int tailCount;
         private final double quality;
 
-        private TailKneeDiagnostic(double quantile, double threshold, double kneeStrength, double stability,
-                double concentration, int tailCount, double quality) {
+        private TailKneeDiagnostic(double quantile, double threshold, double kneeStrength,
+                double deployedKneeStrength, double stability, double concentration, int tailCount, double quality) {
             this.quantile = quantile;
             this.threshold = threshold;
             this.kneeStrength = kneeStrength;
+            this.deployedKneeStrength = deployedKneeStrength;
             this.stability = stability;
             this.concentration = concentration;
             this.tailCount = tailCount;
@@ -2198,7 +2230,7 @@ public final class LineLevelLogAnomalyBenchmark {
             return online.slow.globalRarity(eventId) + 3.0 * keyword
                     + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
         case "global_rarity_keyword_stable_tiebreak":
-            return onlineStableKeywordScore(dataset, online, lineIndex, false, config);
+            return onlineStableKeywordScore(dataset, online, lineIndex, false, true, config);
         case "component_level_rarity_keyword":
             return online.slow.componentLevelRarity(dataset.componentIds.values[lineIndex],
                     dataset.levelIds.values[lineIndex], eventId) + 3.0 * keyword;
@@ -2211,8 +2243,10 @@ public final class LineLevelLogAnomalyBenchmark {
         case "component_rarity_keyword_tiebreak":
             return online.slow.componentRarity(dataset.componentIds.values[lineIndex], eventId) + 3.0 * keyword
                     + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        case "component_rarity_keyword_stable":
+            return onlineStableKeywordScore(dataset, online, lineIndex, true, false, config);
         case "component_rarity_keyword_stable_tiebreak":
-            return onlineStableKeywordScore(dataset, online, lineIndex, true, config);
+            return onlineStableKeywordScore(dataset, online, lineIndex, true, true, config);
         case "component_level_rarity_keyword_gated":
             return onlineComponentLevelGatedKeywordScore(dataset, online, lineIndex, false, config);
         case "component_level_rarity_keyword_gated_tiebreak":
@@ -2251,7 +2285,7 @@ public final class LineLevelLogAnomalyBenchmark {
     }
 
     private static double onlineStableKeywordScore(Dataset dataset, OnlineBaselineState online, int lineIndex,
-            boolean componentRarity, Config config) {
+            boolean componentRarity, boolean includeTieBreak, Config config) {
         int eventId = dataset.eventIds.values[lineIndex];
         int componentId = dataset.componentIds.values[lineIndex];
         int levelId = dataset.levelIds.values[lineIndex];
@@ -2260,9 +2294,10 @@ public final class LineLevelLogAnomalyBenchmark {
                 : online.slow.globalRarity(eventId);
         int keyword = dataset.keywordScores.values[lineIndex];
         double stablePenalty = online.stableSuppression(componentId, levelId, phraseHash, eventId);
-        double score = rarity + 3.0 * keyword
-                + config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex)
-                - 1.25 * stablePenalty;
+        double score = rarity + 3.0 * keyword - 1.25 * stablePenalty;
+        if (includeTieBreak && config.onlineTiebreakWeight > 0.0) {
+            score += config.onlineTiebreakWeight * onlineTieBreakScore(dataset, online, lineIndex);
+        }
         return max(0.0, score);
     }
 
@@ -2475,6 +2510,20 @@ public final class LineLevelLogAnomalyBenchmark {
         while (low < high) {
             int middle = (low + high) >>> 1;
             if (values[middle] < target) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    private static int lowerBound(List<Double> values, double target) {
+        int low = 0;
+        int high = values.size();
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (values.get(middle) < target) {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -3377,6 +3426,126 @@ public final class LineLevelLogAnomalyBenchmark {
         }
     }
 
+    private static final class OnlineFeatureSet {
+        private static final OnlineFeatureSet NONE = new OnlineFeatureSet(false, false, false, false, false, false,
+                false, false, false);
+
+        private final boolean global;
+        private final boolean templateBuckets;
+        private final boolean entity;
+        private final boolean component;
+        private final boolean componentLevel;
+        private final boolean parameters;
+        private final boolean semanticSignature;
+        private final boolean phrase;
+        private final boolean transition;
+
+        private OnlineFeatureSet(boolean global, boolean templateBuckets, boolean entity, boolean component,
+                boolean componentLevel, boolean parameters, boolean semanticSignature, boolean phrase,
+                boolean transition) {
+            this.global = global;
+            this.templateBuckets = templateBuckets;
+            this.entity = entity;
+            this.component = component;
+            this.componentLevel = componentLevel;
+            this.parameters = parameters;
+            this.semanticSignature = semanticSignature;
+            this.phrase = phrase;
+            this.transition = transition;
+        }
+
+        private static OnlineFeatureSet all(boolean parameters) {
+            return new OnlineFeatureSet(true, true, true, true, true, parameters, true, true, true);
+        }
+
+        private static OnlineFeatureSet forBaseline(Config config, String requestedScoreMode, String baseline) {
+            if (!config.useCompactOnlineState()) {
+                return all(config.useParameterFeatures());
+            }
+            String scoreMode = requestedScoreMode == null ? config.scoreMode : requestedScoreMode;
+            if ("auto".equals(scoreMode)) {
+                // Selection needs the union of compact candidate features: global rarity and
+                // component/stable rarity, but not entity, transition, parameter, or spike state.
+                if ("slow".equals(baseline)) {
+                    return new OnlineFeatureSet(true, false, false, true, false, false, false, false, false);
+                }
+                if ("stable".equals(baseline)) {
+                    return new OnlineFeatureSet(true, true, false, false, false, false, true, false, false);
+                }
+                return NONE;
+            }
+            if (usesCompositeOnlineScore(scoreMode)) {
+                return all(config.useParameterFeatures());
+            }
+            boolean stableScore = scoreMode.contains("_stable");
+            boolean componentLevelScore = scoreMode.startsWith("component_level_");
+            boolean componentScore = scoreMode.startsWith("component_rarity_") || componentLevelScore;
+            boolean entityScore = "rarity".equals(scoreMode) || scoreMode.startsWith("rarity_");
+            boolean spikeScore = scoreMode.contains("spike");
+
+            if ("fast".equals(baseline)) {
+                if (!spikeScore) {
+                    return NONE;
+                }
+                return new OnlineFeatureSet(true, false, entityScore, componentScore, componentLevelScore, false,
+                        false, false, false);
+            }
+            if ("stable".equals(baseline)) {
+                if (!stableScore) {
+                    return NONE;
+                }
+                return new OnlineFeatureSet(true, true, false, false, false, false, true, false, false);
+            }
+            boolean global = true;
+            boolean parameters = config.useParameterFeatures() && scoreMode.contains("param");
+            return new OnlineFeatureSet(global, false, entityScore, componentScore, componentLevelScore, parameters,
+                    false, false, false);
+        }
+
+        private static boolean usesCompositeOnlineScore(String scoreMode) {
+            return "combined".equals(scoreMode) || scoreMode.startsWith("bgl_") || scoreMode.contains("semantic")
+                    || "online_composite".equals(scoreMode);
+        }
+
+        private boolean any() {
+            return global || templateBuckets || entity || component || componentLevel || parameters
+                    || semanticSignature || phrase || transition;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder builder = new StringBuilder();
+            if (global) {
+                builder.append('g');
+            }
+            if (templateBuckets) {
+                builder.append('b');
+            }
+            if (entity) {
+                builder.append('e');
+            }
+            if (component) {
+                builder.append('c');
+            }
+            if (componentLevel) {
+                builder.append('l');
+            }
+            if (parameters) {
+                builder.append('p');
+            }
+            if (semanticSignature) {
+                builder.append('s');
+            }
+            if (phrase) {
+                builder.append('r');
+            }
+            if (transition) {
+                builder.append('t');
+            }
+            return builder.length() == 0 ? "-" : builder.toString();
+        }
+    }
+
     private static final class OnlineBaselineState {
         private final OnlineDecayedStats slow;
         private final OnlineDecayedStats fast;
@@ -3384,18 +3553,28 @@ public final class LineLevelLogAnomalyBenchmark {
         private double keywordRarityGate = 1.0;
 
         private OnlineBaselineState(Config config) {
+            this(config, config.scoreMode);
+        }
+
+        private OnlineBaselineState(Config config, String scoreMode) {
             int fastDecayInterval = max(1, min(config.onlineDecayIntervalBuckets,
                     (int) Math.round(hoursToSeconds(config.onlineFastHalfLifeHours)
                             / max(1.0, config.bucketSeconds) / 12.0)));
+            OnlineFeatureSet slowFeatures = OnlineFeatureSet.forBaseline(config, scoreMode, "slow");
+            OnlineFeatureSet fastFeatures = OnlineFeatureSet.forBaseline(config, scoreMode, "fast");
+            OnlineFeatureSet stableFeatures = OnlineFeatureSet.forBaseline(config, scoreMode, "stable");
             slow = new OnlineDecayedStats(daysToSeconds(config.onlineTemplateHalfLifeDays), config.bucketSeconds,
                     config.onlineDecayIntervalBuckets, config.useParameterFeatures(), config.onlineLazyDecay,
-                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth,
+                    slowFeatures);
             fast = new OnlineDecayedStats(hoursToSeconds(config.onlineFastHalfLifeHours), config.bucketSeconds,
                     fastDecayInterval, config.useParameterFeatures(), config.onlineLazyDecay,
-                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth,
+                    fastFeatures);
             stable = new OnlineDecayedStats(daysToSeconds(config.onlineStableHalfLifeDays), config.bucketSeconds,
                     config.onlineDecayIntervalBuckets, config.useParameterFeatures(), config.onlineLazyDecay,
-                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth);
+                    config.onlineCountSketchParameters, config.onlineCountSketchDepth, config.onlineCountSketchWidth,
+                    stableFeatures);
         }
 
         private OnlineBaselineState(OnlineBaselineState other) {
@@ -3406,7 +3585,12 @@ public final class LineLevelLogAnomalyBenchmark {
         }
 
         private static OnlineBaselineState fromWarmup(Dataset dataset, int startBucket, int endBucket, Config config) {
-            OnlineBaselineState state = new OnlineBaselineState(config);
+            return fromWarmup(dataset, startBucket, endBucket, config, config.scoreMode);
+        }
+
+        private static OnlineBaselineState fromWarmup(Dataset dataset, int startBucket, int endBucket, Config config,
+                String scoreMode) {
+            OnlineBaselineState state = new OnlineBaselineState(config, scoreMode);
             for (int bucketIndex = startBucket; bucketIndex < endBucket; bucketIndex++) {
                 long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
                 state.advanceTo(bucketKey);
@@ -3522,6 +3706,7 @@ public final class LineLevelLogAnomalyBenchmark {
         private final boolean useParameterFeatures;
         private final boolean lazyDecay;
         private final boolean sketchParameterPairs;
+        private final OnlineFeatureSet features;
         private final CountMinSketchLong templateParameterSketch;
         private final CountMinSketchLong entityParameterSketch;
         private double globalTotal;
@@ -3534,13 +3719,14 @@ public final class LineLevelLogAnomalyBenchmark {
 
         private OnlineDecayedStats(double halfLifeSeconds, int bucketSeconds, int decayIntervalBuckets,
                 boolean useParameterFeatures, boolean lazyDecay, boolean sketchParameterPairs, int sketchDepth,
-                int sketchWidth) {
+                int sketchWidth, OnlineFeatureSet features) {
             this.halfLifeSeconds = max(1.0, halfLifeSeconds);
             this.bucketSeconds = bucketSeconds;
             this.decayIntervalBuckets = max(1, decayIntervalBuckets);
-            this.useParameterFeatures = useParameterFeatures;
+            this.features = features;
+            this.useParameterFeatures = useParameterFeatures && features.parameters;
             this.lazyDecay = lazyDecay;
-            this.sketchParameterPairs = useParameterFeatures && sketchParameterPairs;
+            this.sketchParameterPairs = this.useParameterFeatures && sketchParameterPairs;
             templateParameterSketch = this.sketchParameterPairs ? new CountMinSketchLong(sketchDepth, sketchWidth)
                     : null;
             entityParameterSketch = this.sketchParameterPairs ? new CountMinSketchLong(sketchDepth, sketchWidth)
@@ -3572,6 +3758,7 @@ public final class LineLevelLogAnomalyBenchmark {
             useParameterFeatures = other.useParameterFeatures;
             lazyDecay = other.lazyDecay;
             sketchParameterPairs = other.sketchParameterPairs;
+            features = other.features;
             templateParameterSketch = other.templateParameterSketch == null ? null
                     : new CountMinSketchLong(other.templateParameterSketch);
             entityParameterSketch = other.entityParameterSketch == null ? null
@@ -3620,6 +3807,7 @@ public final class LineLevelLogAnomalyBenchmark {
             decayIntMap(phraseCounts, decay);
             decayLongMap(transitionCounts, decay);
             decayIntMap(prevTotals, decay);
+            pruneBucketMarkers();
             lastBucketKey = bucketKey;
         }
 
@@ -3627,7 +3815,7 @@ public final class LineLevelLogAnomalyBenchmark {
             int bucketIndex = dataset.bucketIndexes.values[lineIndex];
             long bucketKey = dataset.buckets.get(bucketIndex).bucketKey;
             advanceTo(bucketKey);
-            if (weight <= 0.0) {
+            if (weight <= 0.0 || !features.any()) {
                 return;
             }
             int eventId = dataset.eventIds.values[lineIndex];
@@ -3637,23 +3825,33 @@ public final class LineLevelLogAnomalyBenchmark {
             int parameterHash = dataset.parameterHashes.values[lineIndex];
             int phraseHash = dataset.phraseHashes.values[lineIndex];
             int prevEventId = dataset.prevEventIds.values[lineIndex];
-            if (!globalCounts.containsKey(eventId)) {
-                ++vocabularySize;
+            if (features.global) {
+                if (!globalCounts.containsKey(eventId)) {
+                    ++vocabularySize;
+                }
+                add(globalCounts, eventId, weight);
+                globalTotal += weight;
             }
-            add(globalCounts, eventId, weight);
-            Long previousTemplateBucket = lastTemplateBucket.put(eventId, bucketKey);
-            if (previousTemplateBucket == null || previousTemplateBucket.longValue() != bucketKey) {
-                add(templateBucketCounts, eventId, weight);
+            if (features.templateBuckets) {
+                Long previousTemplateBucket = lastTemplateBucket.put(eventId, bucketKey);
+                if (previousTemplateBucket == null || previousTemplateBucket.longValue() != bucketKey) {
+                    add(templateBucketCounts, eventId, weight);
+                }
             }
-            long entityEventKey = entityEventKey(entityId, eventId);
-            long componentEventKey = entityEventKey(componentId, eventId);
-            long componentLevelKey = componentLevelKey(componentId, levelId);
-            add(entityEventCounts, entityEventKey, weight);
-            add(entityTotals, entityId, weight);
-            add(componentEventCounts, componentEventKey, weight);
-            add(componentTotals, componentId, weight);
-            add(componentLevelEventCounts, componentLevelEventKey(componentId, levelId, eventId), weight);
-            add(componentLevelTotals, componentLevelKey, weight);
+            long entityEventKey = features.entity || features.parameters ? entityEventKey(entityId, eventId) : 0L;
+            if (features.entity) {
+                add(entityEventCounts, entityEventKey, weight);
+                add(entityTotals, entityId, weight);
+            }
+            if (features.component) {
+                add(componentEventCounts, entityEventKey(componentId, eventId), weight);
+                add(componentTotals, componentId, weight);
+            }
+            if (features.componentLevel) {
+                long componentLevelKey = componentLevelKey(componentId, levelId);
+                add(componentLevelEventCounts, componentLevelEventKey(componentId, levelId, eventId), weight);
+                add(componentLevelTotals, componentLevelKey, weight);
+            }
             if (useParameterFeatures && parameterHash != 0) {
                 if (parameterVocabularySize < PARAMETER_VOCABULARY_CAP) {
                     if (!parameterCounts.containsKey(parameterHash)) {
@@ -3664,24 +3862,31 @@ public final class LineLevelLogAnomalyBenchmark {
                 addTemplateParameter(entityEventKey(eventId, parameterHash), weight);
                 addEntityParameter(entityEventKey(entityId, parameterHash), weight);
             }
-            if (phraseHash != 0) {
+            if ((features.semanticSignature || features.phrase) && phraseHash != 0) {
                 long signatureKey = semanticSignatureKey(componentId, levelId, phraseHash);
-                if (!semanticSignatureCounts.containsKey(signatureKey)) {
-                    ++semanticSignatureVocabularySize;
+                if (features.semanticSignature) {
+                    if (!semanticSignatureCounts.containsKey(signatureKey)) {
+                        ++semanticSignatureVocabularySize;
+                    }
+                    add(semanticSignatureCounts, signatureKey, weight);
                 }
-                if (!phraseCounts.containsKey(phraseHash)) {
-                    ++phraseVocabularySize;
+                if (features.phrase) {
+                    if (!phraseCounts.containsKey(phraseHash)) {
+                        ++phraseVocabularySize;
+                    }
+                    add(phraseCounts, phraseHash, weight);
                 }
-                add(semanticSignatureCounts, signatureKey, weight);
-                add(phraseCounts, phraseHash, weight);
-                Long previousBucket = lastSemanticSignatureBucket.put(signatureKey, bucketKey);
-                if (previousBucket == null || previousBucket.longValue() != bucketKey) {
-                    add(semanticSignatureBucketCounts, signatureKey, weight);
+                if (features.semanticSignature) {
+                    Long previousBucket = lastSemanticSignatureBucket.put(signatureKey, bucketKey);
+                    if (previousBucket == null || previousBucket.longValue() != bucketKey) {
+                        add(semanticSignatureBucketCounts, signatureKey, weight);
+                    }
                 }
             }
-            add(transitionCounts, transitionKey(prevEventId, eventId), weight);
-            add(prevTotals, prevEventId, weight);
-            globalTotal += weight;
+            if (features.transition) {
+                add(transitionCounts, transitionKey(prevEventId, eventId), weight);
+                add(prevTotals, prevEventId, weight);
+            }
         }
 
         private double globalCount(int eventId) {
@@ -3830,8 +4035,9 @@ public final class LineLevelLogAnomalyBenchmark {
 
         private String entrySummary() {
             return String.format(Locale.ROOT,
-                    "total=%.1f scale=%.3g maps=%d sketchParam=%s global=%d entityEvent=%d entityTotals=%d componentEvent=%d componentTotals=%d componentLevelEvent=%d componentLevelTotals=%d templateParam=%d entityParam=%d param=%d signature=%d signatureBuckets=%d phrase=%d transition=%d prevTotals=%d",
-                    globalTotal, scale, entryCount(), sketchParameterPairs ? "true" : "false", globalCounts.size(), entityEventCounts.size(), entityTotals.size(),
+                    "total=%.1f scale=%.3g features=%s maps=%d sketchParam=%s global=%d entityEvent=%d entityTotals=%d componentEvent=%d componentTotals=%d componentLevelEvent=%d componentLevelTotals=%d templateParam=%d entityParam=%d param=%d signature=%d signatureBuckets=%d phrase=%d transition=%d prevTotals=%d",
+                    globalTotal, scale, features, entryCount(), sketchParameterPairs ? "true" : "false",
+                    globalCounts.size(), entityEventCounts.size(), entityTotals.size(),
                     componentEventCounts.size(), componentTotals.size(), componentLevelEventCounts.size(),
                     componentLevelTotals.size(), templateParameterCounts.size(), entityParameterCounts.size(),
                     parameterCounts.size(), semanticSignatureCounts.size(), semanticSignatureBucketCounts.size(),
@@ -3925,7 +4131,13 @@ public final class LineLevelLogAnomalyBenchmark {
             rescaleIntMap(phraseCounts);
             rescaleLongMap(transitionCounts);
             rescaleIntMap(prevTotals);
+            pruneBucketMarkers();
             scale = 1.0;
+        }
+
+        private void pruneBucketMarkers() {
+            lastTemplateBucket.keySet().retainAll(globalCounts.keySet());
+            lastSemanticSignatureBucket.keySet().retainAll(semanticSignatureCounts.keySet());
         }
 
         private void rescaleIntMap(Map<Integer, Double> map) {
@@ -6046,6 +6258,7 @@ public final class LineLevelLogAnomalyBenchmark {
         private final List<Double> fdrQValues;
         private final String statsPeriod;
         private final String scoreMode;
+        private final String memoryProfile;
         private final int rollingHorizonBuckets;
         private final int rollingBins;
         private final double rollingScoreMax;
@@ -6101,7 +6314,8 @@ public final class LineLevelLogAnomalyBenchmark {
                 int drainMaxChildren, int numberOfTrees, int sampleSize, int outputAfter, double zFactor, long seed,
                 int progressInterval, int top, boolean includeUngated, List<Double> contextAnomalyRates,
                 String thresholdMode, List<Double> fdrQValues, String statsPeriod, String scoreMode,
-                int rollingHorizonBuckets, int rollingBins, double rollingScoreMax, boolean excludeAlertUpdates,
+                String memoryProfile, int rollingHorizonBuckets, int rollingBins, double rollingScoreMax,
+                boolean excludeAlertUpdates,
                 int expandBuckets, int tailBlockBuckets, int tailMinSelected, double tailSignificance,
                 boolean parameterFeatures, boolean entityBucketCounts, double diagnosticRecallTarget,
                 int diagnosticTopTemplates, int diagnosticSamples, List<QuantilePair> seedExpandPairs,
@@ -6145,6 +6359,7 @@ public final class LineLevelLogAnomalyBenchmark {
             this.fdrQValues = fdrQValues;
             this.statsPeriod = statsPeriod;
             this.scoreMode = scoreMode;
+            this.memoryProfile = memoryProfile;
             this.rollingHorizonBuckets = rollingHorizonBuckets;
             this.rollingBins = rollingBins;
             this.rollingScoreMax = rollingScoreMax;
@@ -6245,6 +6460,7 @@ public final class LineLevelLogAnomalyBenchmark {
                     splitDoubles(values.getOrDefault("fdr-q", fdrDefault)),
                     values.getOrDefault("stats-period", "train").toLowerCase(Locale.ROOT),
                     scoreModeValue,
+                    values.getOrDefault("memory-profile", "rich").toLowerCase(Locale.ROOT),
                     Integer.parseInt(values.getOrDefault("rolling-horizon-buckets", "144")),
                     Integer.parseInt(values.getOrDefault("rolling-bins", "4096")),
                     Double.parseDouble(values.getOrDefault("rolling-score-max", "80.0")),
@@ -6297,8 +6513,17 @@ public final class LineLevelLogAnomalyBenchmark {
         }
 
         private boolean useParameterFeatures() {
+            if (useCompactOnlineState()) {
+                return parameterFeatures || scoreMode.contains("param");
+            }
             return parameterFeatures || "auto".equals(scoreMode) || scoreMode.contains("param") || scoreMode.contains("tiebreak")
                     || scoreMode.startsWith("bgl_") || useSemanticFeatures();
+        }
+
+        private boolean useCompactOnlineState() {
+            return "compact".equals(memoryProfile) || "default-100mb".equals(memoryProfile)
+                    || "default_100mb".equals(memoryProfile) || "tiny".equals(memoryProfile)
+                    || "tiny-10mb".equals(memoryProfile) || "tiny_10mb".equals(memoryProfile);
         }
 
         private boolean useFixedAnchorQuantile() {
@@ -6328,6 +6553,10 @@ public final class LineLevelLogAnomalyBenchmark {
         }
 
         private boolean useEntityBucketCounts() {
+            if (useCompactOnlineState()) {
+                return entityBucketCounts || scoreMode.contains("spike") || scoreMode.startsWith("bgl_")
+                        || useSemanticFeatures();
+            }
             return entityBucketCounts || scoreMode.contains("spike") || scoreMode.contains("tiebreak")
                     || scoreMode.startsWith("bgl_") || scoreMode.equals("combined") || useSemanticFeatures();
         }
